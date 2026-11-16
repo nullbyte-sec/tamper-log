@@ -2,5 +2,7 @@
   "name": "Tamper Blocker",
   "description": "Real-time Kali Linux log-tamper monitor, file integrity verification, SHA-256 hash-chain auditing, and interactive tamplogs terminal console.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

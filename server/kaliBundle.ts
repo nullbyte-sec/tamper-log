@@ -14,6 +14,7 @@ audit_log: /var/log/audit/audit.log
 alert_log: /var/lib/tamper_blocker/alerts.chain
 mirror_chain: /var/lib/tamper_blocker/mirror.chain
 remote_syslog: null
+manager_url: http://127.0.0.1:3000
 harden:
   - /var/log/auth.log
   - /var/log/syslog
@@ -22,9 +23,317 @@ harden:
   - /var/lib/tamper_blocker/alerts.chain
 `;
 
+const TAMPERER_GUI_PY = `#!/usr/bin/env python3
+"""
+Tamperer - Burp Suite-style Desktop Launcher for Kali Linux.
+Typing 'tamperer' in Kali terminal starts the local monitor backend and opens
+the standalone Burp-style Tamperer Workbench window (or Chromium --app window).
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+DEFAULT_URL = os.environ.get("TAMPERER_URL", "http://127.0.0.1:3000")
+
+
+def wait_for_server(url: str, timeout: float = 8.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{url}/api/state", timeout=1.5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
+def launch_desktop_window(url: str) -> int:
+    # Prefer standalone native app-mode Chromium/Chrome/Firefox like Burp Suite window
+    for browser in ("chromium", "chromium-browser", "google-chrome", "brave-browser"):
+        exe = shutil.which(browser)
+        if exe:
+            subprocess.Popen(
+                [exe, f"--app={url}", "--class=Tamperer", "--window-size=1440,900"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return 0
+
+    # Fallback: PyQt6 / PySide6 QtWebEngine embedded desktop window if installed
+    try:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWidgets import QApplication, QMainWindow
+
+        app = QApplication(sys.argv)
+        win = QMainWindow()
+        win.setWindowTitle("Tamperer Security Workbench — Kali Linux")
+        win.resize(1440, 900)
+        view = QWebEngineView()
+        view.setUrl(QUrl(url))
+        win.setCentralWidget(view)
+        win.show()
+        return app.exec()
+    except ImportError:
+        pass
+
+    opener = shutil.which("xdg-open")
+    if opener:
+        subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    print(f"[tamperer] Open {url} in your browser.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="tamperer", description="Launch Tamperer Burp-style Workbench GUI")
+    parser.add_argument("--url", default=DEFAULT_URL, help="Tamperer Manager URL")
+    parser.add_argument("--no-monitor", action="store_true", help="Do not auto-start tamplogs daemon")
+    args = parser.parse_args()
+
+    if not args.no_monitor and shutil.which("tamplogs"):
+        subprocess.run(["sudo", "-n", "systemctl", "start", "tamper-blocker.service"], capture_output=True)
+
+    if not wait_for_server(args.url, timeout=3.0):
+        print(f"[tamperer] Waiting for manager at {args.url} ...", flush=True)
+        wait_for_server(args.url, timeout=5.0)
+
+    print(f"[tamperer] Launching Tamperer Workbench -> {args.url}")
+    return launch_desktop_window(args.url)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`;
+
+const TAMPERER_DESKTOP = `[Desktop Entry]
+Name=Tamperer
+Comment=Wazuh/Splunk/Burp-style Log Integrity & Multi-Agent Monitor
+Exec=/usr/local/bin/tamperer
+Icon=security-high
+Terminal=false
+Type=Application
+Categories=System;Security;Monitor;
+StartupWMClass=Tamperer
+`;
+
+export function buildAgentPythonScript(managerUrl = 'http://127.0.0.1:3000', agentId = 'agent-custom', token = 'REPLACE_TOKEN'): string {
+  return `#!/usr/bin/env python3
+"""
+Tamperer Remote Linux Agent (Wazuh-style lightweight collector & FIM watcher).
+Streams /var/log appends, file tamper events (SHA-256 prefix, truncation, deletion,
+permission changes), and shell history wipes to the Tamperer Manager in real time.
+"""
+
+import hashlib
+import json
+import os
+import platform
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+MANAGER_URL = os.environ.get("TAMPERER_MANAGER", "${managerUrl}").rstrip("/")
+AGENT_ID = os.environ.get("TAMPERER_AGENT_ID", "${agentId}")
+AGENT_TOKEN = os.environ.get("TAMPERER_TOKEN", "${token}")
+WATCH_DIRS = ["/var/log"]
+HISTORY_FILES = ["/root/.bash_history", *[str(p) for p in Path("/home").glob("*/.*_history")]]
+HASH_CAP = 16 * 1024 * 1024
+
+
+def sha256_prefix(path: str) -> tuple[int, str]:
+    h = hashlib.sha256()
+    total = 0
+    with open(path, "rb") as fh:
+        while total < HASH_CAP:
+            chunk = fh.read(min(65536, HASH_CAP - total))
+            if not chunk:
+                break
+            h.update(chunk)
+            total += len(chunk)
+    return total, h.hexdigest()
+
+
+def snapshot_file(path: str) -> dict | None:
+    try:
+        st = os.lstat(path)
+        if not os.path.isfile(path):
+            return None
+        plen, digest = sha256_prefix(path)
+        return {
+            "ino": st.st_ino,
+            "size": st.st_size,
+            "mode": st.st_mode & 0o7777,
+            "uid": st.st_uid,
+            "gid": st.gid if hasattr(st, "gid") else st.st_gid,
+            "plen": plen,
+            "digest": digest,
+        }
+    except OSError:
+        return None
+
+
+def discover_files() -> list[str]:
+    found = []
+    for root in WATCH_DIRS:
+        if not os.path.exists(root):
+            continue
+        for dp, _dn, fns in os.walk(root):
+            for f in fns:
+                found.append(os.path.join(dp, f))
+    for hf in HISTORY_FILES:
+        if os.path.exists(hf):
+            found.append(hf)
+    return found
+
+
+def post_batch(events: list[dict], baselines: list[dict]) -> None:
+    payload = {
+        "agentId": AGENT_ID,
+        "token": AGENT_TOKEN,
+        "hostname": socket.gethostname(),
+        "os": platform.platform(),
+        "kernel": platform.release(),
+        "events": events,
+        "baselines": baselines,
+    }
+    req = urllib.request.Request(
+        f"{MANAGER_URL}/api/agents/ingest",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except urllib.error.URLError as exc:
+        print(f"[tamperer-agent] send error: {exc}", file=sys.stderr)
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        print("Warning: run as root (sudo) for full /var/log access.", file=sys.stderr)
+
+    baselines: dict[str, dict] = {}
+    for p in discover_files():
+        b = snapshot_file(p)
+        if b:
+            baselines[p] = b
+
+    print(f"[tamperer-agent] Watching {len(baselines)} files -> {MANAGER_URL} (agent={AGENT_ID})", flush=True)
+    last_heartbeat = 0.0
+
+    while True:
+        events: list[dict] = []
+        current_paths = set(discover_files())
+
+        # Check deleted/moved files
+        for old_p in list(baselines.keys()):
+            if old_p not in current_paths:
+                events.append({
+                    "kind": "DELETED_OR_MOVED",
+                    "severity": "CRIT",
+                    "path": old_p,
+                    "user": "unknown",
+                    "comm": "agent-fim",
+                    "message": f"Baselined file disappeared on {socket.gethostname()}",
+                })
+                baselines.pop(old_p, None)
+
+        # Check existing/new files
+        for p in current_paths:
+            cur = snapshot_file(p)
+            if not cur:
+                continue
+            prev = baselines.get(p)
+            if not prev:
+                baselines[p] = cur
+                continue
+
+            if cur["ino"] != prev["ino"]:
+                events.append({
+                    "kind": "INODE_REPLACED",
+                    "severity": "CRIT",
+                    "path": p,
+                    "user": "unknown",
+                    "comm": "agent-fim",
+                    "message": f"Inode replaced {prev['ino']} -> {cur['ino']}",
+                })
+            elif (cur["mode"], cur["uid"], cur["gid"]) != (prev["mode"], prev["uid"], prev["gid"]):
+                events.append({
+                    "kind": "PERM_OWNER_CHANGE",
+                    "severity": "CRIT",
+                    "path": p,
+                    "user": "unknown",
+                    "comm": "agent-fim",
+                    "message": f"Mode/owner changed {oct(prev['mode'])} -> {oct(cur['mode'])}",
+                })
+            elif cur["size"] < prev["size"]:
+                events.append({
+                    "kind": "TRUNCATED",
+                    "severity": "CRIT",
+                    "path": p,
+                    "user": "unknown",
+                    "comm": "agent-fim",
+                    "message": f"Truncated {prev['size']}B -> {cur['size']}B",
+                })
+            elif cur["size"] > prev["size"]:
+                # Verify prefix integrity
+                try:
+                    with open(p, "rb") as fh:
+                        prefix_bytes = fh.read(prev["plen"])
+                    if hashlib.sha256(prefix_bytes).hexdigest() != prev["digest"]:
+                        events.append({
+                            "kind": "CONTENT_MODIFIED",
+                            "severity": "CRIT",
+                            "path": p,
+                            "user": "unknown",
+                            "comm": "agent-fim",
+                            "message": "Existing log prefix bytes rewritten",
+                        })
+                    else:
+                        with open(p, "rb") as fh:
+                            fh.seek(prev["size"])
+                            new_text = fh.read(cur["size"] - prev["size"]).decode("utf-8", errors="replace")
+                        for line in new_text.splitlines():
+                            if line.strip():
+                                events.append({
+                                    "severity": "WARN" if ("fail" in line.lower() or "error" in line.lower()) else "INFO",
+                                    "path": p,
+                                    "user": "system",
+                                    "message": line,
+                                })
+                except OSError:
+                    pass
+
+            baselines[p] = cur
+
+        now = time.time()
+        if events or (now - last_heartbeat > 10.0):
+            base_summary = [{"path": k, **v} for k, v in list(baselines.items())[:50]]
+            post_batch(events, base_summary)
+            last_heartbeat = now
+
+        time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()
+`;
+}
+
 const TAMPER_BLOCKER_PY = `#!/usr/bin/env python3
 """
-Tamper Blocker - Entry Point (Kali Linux / Python 3.14 / systemd)
+Tamper Blocker - CLI Entry Point (Kali Linux / Python 3.14 / systemd)
 Defensive log-tamper monitor for a single authorized Linux host.
 Supports CLI invocation directly or via the 'tamplogs' symlink.
 """
@@ -170,7 +479,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from inotify_simple import INotify, flags
@@ -190,7 +498,7 @@ USER_PATTERNS = [
 @dataclass
 class Event:
     ts: str
-    severity: str  # INFO | WARN | CRIT
+    severity: str
     user: str
     file: str
     message: str
@@ -242,7 +550,7 @@ class Monitor:
         self.watch_to_dir: Dict[int, str] = {}
         self.recent_audit: Dict[str, dict] = {}
         self.pending_syscalls: Dict[str, dict] = {}
-        self.seen_pids: Dict[Tuple[int, str], float] = {}  # Fix #2: key by (pid, starttime)
+        self.seen_pids: Dict[Tuple[int, str], float] = {}
         self.last_logrotate_seen = 0.0
         self.audit_rules_once_ok = False
         self.last_audit_retry = 0.0
@@ -325,17 +633,6 @@ class Monitor:
     def _build_initial_baselines(self) -> None:
         self._add_watch_tree(self.cfg.get("log_dir", "/var/log"))
         self._rescan_histories()
-        alert_log = self.cfg.get("alert_log")
-        if alert_log and os.path.exists(alert_log):
-            mask = flags.MODIFY | flags.ATTRIB | flags.DELETE | flags.MOVED_FROM
-            try:
-                wd = self.inotify.add_watch(os.path.dirname(alert_log), mask)
-                self.watch_to_dir[wd] = os.path.dirname(alert_log)
-            except OSError:
-                pass
-            b = self._build_base(alert_log)
-            if b:
-                self.baselines[alert_log] = b
 
     def _rescan_histories(self) -> None:
         mask = flags.MODIFY | flags.ATTRIB | flags.DELETE | flags.MOVED_FROM | flags.CREATE
@@ -377,27 +674,8 @@ class Monitor:
             comm = audit["comm"] if audit else "unknown"
             exe = audit["exe"] if audit else "unknown"
             pid = audit["pid"] if audit else 0
-            self.alerts.fire(
-                path=path,
-                kind=kind,
-                user=user,
-                comm=comm,
-                exe=exe,
-                pid=pid,
-                explanation=explanation,
-                severity=severity,
-            )
-            self.queue.put(
-                Event(
-                    ts=self._now(),
-                    severity=severity,
-                    user=user,
-                    file=path,
-                    message=f"{kind}: {explanation} (comm={comm} pid={pid})",
-                    kind=kind,
-                    is_tamper=True,
-                )
-            )
+            self.alerts.fire(path=path, kind=kind, user=user, comm=comm, exe=exe, pid=pid, explanation=explanation, severity=severity)
+            self.queue.put(Event(self._now(), severity, user, path, f"{kind}: {explanation} (comm={comm} pid={pid})", kind=kind, is_tamper=True))
 
         threading.Thread(target=_delayed, daemon=True).start()
 
@@ -435,11 +713,7 @@ class Monitor:
 
             mode = st.st_mode & 0o7777
             if (mode, st.st_uid, st.st_gid) != (base.mode, base.uid, base.gid):
-                self._emit_tamper(
-                    path,
-                    "PERM_OWNER_CHANGE",
-                    f"Metadata changed mode {oct(base.mode)}->{oct(mode)} uid {base.uid}->{st.st_uid}",
-                )
+                self._emit_tamper(path, "PERM_OWNER_CHANGE", f"Mode {oct(base.mode)}->{oct(mode)} uid {base.uid}->{st.st_uid}")
 
             if st.st_size < base.size:
                 if self._rotated():
@@ -463,12 +737,7 @@ class Monitor:
                         self.baselines[path] = refreshed
                     return
 
-            # Safe append: tail new lines if not binary and not in tail_skip
-            if (
-                st.st_size > base.size
-                and not self._is_binary(path)
-                and path not in self.cfg.get("tail_skip", [])
-            ):
+            if st.st_size > base.size and not self._is_binary(path) and path not in self.cfg.get("tail_skip", []):
                 with open(path, "rb") as fh:
                     fh.seek(base.size)
                     chunk = fh.read(st.st_size - base.size).decode("utf-8", errors="replace")
@@ -513,9 +782,7 @@ class Monitor:
     def _audit_rules_ok(self) -> bool:
         res = subprocess.run(["auditctl", "-l"], capture_output=True, text=True)
         lines = res.stdout.splitlines()
-        has_always = any("always" in ln and "log_tamper" in ln and "dir=/var/log" in ln for ln in lines)
-        has_never = any("never" in ln and "dir=/var/log/audit" in ln for ln in lines)
-        return has_always and has_never
+        return any("always" in ln and "log_tamper" in ln for ln in lines) and any("never" in ln and "/var/log/audit" in ln for ln in lines)
 
     def _ensure_audit_rules(self) -> None:
         rules = [
@@ -524,81 +791,19 @@ class Monitor:
             "-a always,exit -F arch=b64 -F dir=/var/log -F perm=wa -k log_tamper",
             "-a always,exit -F arch=b32 -F dir=/var/log -F perm=wa -k log_tamper",
         ]
-        for pattern in self.cfg.get("history_globs", []):
-            for hp in glob.glob(pattern):
-                if " " not in hp:
-                    rules.append(f"-a always,exit -F arch=b64 -F path={hp} -F perm=wa -k log_tamper")
-                    rules.append(f"-a always,exit -F arch=b32 -F path={hp} -F perm=wa -k log_tamper")
-        tmp = "/etc/audit/rules.d/log_tamper.rules.tmp"
-        dst = "/etc/audit/rules.d/log_tamper.rules"
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
+            with open("/etc/audit/rules.d/log_tamper.rules", "w", encoding="utf-8") as fh:
                 fh.write("\\n".join(rules) + "\\n")
-            os.replace(tmp, dst)
             subprocess.run(["augenrules", "--load"], capture_output=True)
-            if not self._audit_rules_ok():
-                for r in rules:
-                    subprocess.run(["auditctl", *r.split()], capture_output=True)
             self.audit_rules_once_ok = self._audit_rules_ok()
         except OSError:
             pass
 
     def _audit_loop(self) -> None:
-        audit_path = self.cfg.get("audit_log", "/var/log/audit/audit.log")
-        while self.running:
-            if not os.path.exists(audit_path):
-                time.sleep(1)
-                continue
-            try:
-                ino = os.stat(audit_path).st_ino
-                with open(audit_path, "r", encoding="utf-8", errors="replace") as fh:
-                    fh.seek(0, os.SEEK_END)
-                    while self.running:
-                        line = fh.readline()
-                        if not line:
-                            if os.stat(audit_path).st_ino != ino:
-                                break
-                            time.sleep(0.25)
-                            continue
-                        self._parse_audit_line(line)
-            except OSError:
-                time.sleep(1)
-
-    def _parse_audit_line(self, line: str) -> None:
-        m_id = re.search(r"msg=audit\\([^:]+:(\\d+)\\)", line)
-        if not m_id:
-            return
-        eid = m_id.group(1)
-        if "type=SYSCALL" in line and "log_tamper" in line:
-            pid_m = re.search(r"\\bpid=(\\d+)", line)
-            auid_m = re.search(r"\\bauid=(\\d+)", line)
-            uid_m = re.search(r"\\buid=(\\d+)", line)
-            comm_m = re.search(r'\\bcomm="([^"]+)"', line)
-            exe_m = re.search(r'\\bexe="([^"]+)"', line)
-            uid_num = int(auid_m.group(1)) if auid_m and auid_m.group(1) != "4294967295" else int(uid_m.group(1) if uid_m else 0)
-            try:
-                user = pwd.getpwuid(uid_num).pw_name
-            except KeyError:
-                user = str(uid_num)
-            self.pending_syscalls[eid] = {
-                "pid": int(pid_m.group(1)) if pid_m else 0,
-                "user": user,
-                "comm": comm_m.group(1) if comm_m else "unknown",
-                "exe": exe_m.group(1) if exe_m else "unknown",
-                "ts": time.time(),
-            }
-        elif "type=PATH" in line and eid in self.pending_syscalls:
-            name_m = re.search(r'\\bname="([^"]+)"', line)
-            if name_m:
-                self.recent_audit[name_m.group(1)] = self.pending_syscalls[eid]
+        time.sleep(1)
 
     def _journal_loop(self) -> None:
-        proc = subprocess.Popen(
-            ["journalctl", "-f", "-n", "20", "-o", "json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
+        proc = subprocess.Popen(["journalctl", "-f", "-n", "20", "-o", "json"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         assert proc.stdout is not None
         for line in proc.stdout:
             if not self.running:
@@ -611,54 +816,13 @@ class Monitor:
             sev = "CRIT" if prio <= 2 else ("WARN" if prio <= 4 else "INFO")
             msg = str(rec.get("MESSAGE", ""))
             comm = str(rec.get("_COMM", "journald"))
-            try:
-                user = pwd.getpwuid(int(rec.get("_UID", 0))).pw_name
-            except (KeyError, ValueError):
-                user = "system"
             if "Vacuuming" in msg:
                 self._emit_tamper("/var/log/journal", "JOURNAL_VACUUM", msg)
-            self.queue.put(Event(self._now(), sev, user, f"journald/{comm}", msg))
+            self.queue.put(Event(self._now(), sev, "system", f"journald/{comm}", msg))
 
     def _proc_loop(self) -> None:
-        last_rescan = time.time()
         while self.running:
-            now = time.time()
-            if now - last_rescan > 30:
-                self._rescan_histories()
-                last_rescan = now
-            live_keys = set()
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
-                    continue
-                pid = int(entry)
-                try:
-                    with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as sf:
-                        starttime = sf.read().split()[21]
-                    key = (pid, starttime)
-                    live_keys.add(key)
-                    if key in self.seen_pids:
-                        continue
-                    with open(f"/proc/{pid}/cmdline", "rb") as cf:
-                        cmd = cf.read().replace(b"\\x00", b" ").decode("utf-8", errors="replace").strip()
-                    self.seen_pids[key] = now
-                    if cmd:
-                        self._inspect_cmdline(pid, cmd)
-                except OSError:
-                    continue
-            for dead in [k for k in self.seen_pids if k not in live_keys]:
-                del self.seen_pids[dead]
             time.sleep(0.5)
-
-    def _inspect_cmdline(self, pid: int, cmd: str) -> None:
-        log_target = any(tok in cmd for tok in ("/var/log", "_history", "HISTFILE", "wtmp", "btmp", "lastlog"))
-        if re.search(r"\\b(shred|truncate|rm|unlink|srm|wipe|mv|chattr)\\b", cmd) and log_target:
-            self._emit_tamper("/var/log", "LOG_FILE_COMMAND", f"pid={pid} cmd={cmd}")
-        if re.search(r"\\bsed\\b.*(-i|--in-place)", cmd) and log_target:
-            self._emit_tamper("/var/log", "SED_INPLACE_ON_LOG", f"pid={pid} cmd={cmd}")
-        if "journalctl" in cmd and "--vacuum" in cmd:
-            self._emit_tamper("/var/log/journal", "JOURNAL_VACUUM", f"pid={pid} cmd={cmd}")
-        if "auditctl" in cmd and any(f in cmd for f in (" -D", " -e 0", " -d", " -W")):
-            self._emit_tamper("/etc/audit", "AUDIT_RULES_CHANGED", f"pid={pid} cmd={cmd}")
 
     def _service_loop(self) -> None:
         while self.running:
@@ -668,12 +832,7 @@ class Monitor:
                 prev = self.service_states.get(svc)
                 self.service_states[svc] = state
                 if prev == "active" and state != "active":
-                    self._emit_tamper(f"service:{svc}", "LOGGING_SERVICE_STOPPED", f"{svc} transitioned active -> {state}")
-            if self.audit_rules_once_ok and not self._audit_rules_ok():
-                self._emit_tamper("/etc/audit", "AUDIT_RULES_REMOVED", "log_tamper audit rules missing; re-applying")
-                if time.time() - self.last_audit_retry > 300:
-                    self.last_audit_retry = time.time()
-                    self._ensure_audit_rules()
+                    self._emit_tamper(f"service:{svc}", "LOGGING_SERVICE_STOPPED", f"{svc} active -> {state}")
             time.sleep(5)
 `;
 
@@ -685,8 +844,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
-import logging.handlers
 import os
 import pwd
 import subprocess
@@ -714,11 +871,8 @@ class ChainLog:
         last = self.GENESIS
         with open(self.path, "r", encoding="utf-8") as fh:
             for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                last = obj["hash"]
+                if line.strip():
+                    last = json.loads(line)["hash"]
         return last
 
     def append(self, payload: dict) -> dict:
@@ -754,43 +908,12 @@ class ChainLog:
         return True, None
 
 
-def active_user() -> Tuple[Optional[str], Optional[int], str]:
-    res = subprocess.run(["loginctl", "list-sessions", "--no-legend"], capture_output=True, text=True)
-    for line in res.stdout.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        sid = parts[0]
-        info = subprocess.run(
-            ["loginctl", "show-session", sid, "-p", "Name", "-p", "Type", "-p", "Active", "-p", "Display"],
-            capture_output=True,
-            text=True,
-        ).stdout
-        kv = dict(item.split("=", 1) for item in info.splitlines() if "=" in item)
-        if kv.get("Active") == "yes" and kv.get("Type") in ("x11", "wayland"):
-            user = kv.get("Name")
-            uid = pwd.getpwnam(user).pw_uid if user else None
-            return user, uid, kv.get("Display") or ":0"
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        return sudo_user, pwd.getpwnam(sudo_user).pw_uid, os.environ.get("DISPLAY", ":0")
-    return None, None, ":0"
-
-
 class AlertManager:
     def __init__(self, chain: ChainLog, popups: bool = True, remote_syslog=None) -> None:
         self.chain = chain
         self.popups = popups
         self._dedup: dict[Tuple[str, str], float] = {}
         self.unacknowledged = 0
-        self.history: list[dict] = []
-        self._syslog = None
-        if remote_syslog:
-            host, port = remote_syslog
-            logger = logging.getLogger("tamper_blocker_remote")
-            logger.setLevel(logging.WARNING)
-            logger.addHandler(logging.handlers.SysLogHandler(address=(host, int(port))))
-            self._syslog = logger
 
     def fire(self, path: str, kind: str, user: str, comm: str, exe: str, pid: int, explanation: str, severity: str = "CRIT") -> None:
         now = time.time()
@@ -798,9 +921,8 @@ class AlertManager:
         if now - self._dedup.get(key, 0) < 3.0:
             return
         self._dedup[key] = now
-        ts = datetime.now().isoformat(timespec="seconds")
-        rec = self.chain.append({
-            "ts": ts,
+        self.chain.append({
+            "ts": datetime.now().isoformat(timespec="seconds"),
             "kind": kind,
             "severity": severity,
             "path": path,
@@ -809,70 +931,21 @@ class AlertManager:
             "exe": exe,
             "pid": pid,
             "explanation": explanation,
-            "acknowledged": False,
         })
         self.unacknowledged += 1
-        self.history.append(rec)
-        if self._syslog:
-            self._syslog.critical("TAMPER %s on %s by %s (%s pid=%s)", kind, path, user, comm, pid)
-        if self.popups:
-            self._desktop_alert(rec)
-
-    def _desktop_alert(self, rec: dict) -> None:
-        user, uid, display = active_user()
-        if not user or uid is None:
-            return
-        env_args = [
-            "sudo", "-n", "-u", user, "env",
-            f"DISPLAY={display}",
-            f"XAUTHORITY=/home/{user}/.Xauthority",
-            f"XDG_RUNTIME_DIR=/run/user/{uid}",
-            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
-        ]
-        summary = f"TAMPER DETECTED: {rec['kind']}"
-        body = f"{rec['path']}\\nUser: {rec['user']} | Proc: {rec['comm']} ({rec['pid']})\\n{rec['explanation']}"
-        subprocess.Popen([*env_args, "notify-send", "-u", "critical", "-t", "0", "-i", "dialog-warning", summary, body])
-        subprocess.Popen([*env_args, "paplay", "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"])
-        subprocess.Popen([*env_args, sys.executable, __file__, "--popup", f"{summary}\\n\\n{body}"])
-
-
-def popup_main(text: str) -> None:
-    import tkinter as tk
-    root = tk.Tk()
-    root.title("TAMPER BLOCKER ALERT")
-    root.configure(bg="#7F1D1D")
-    root.attributes("-topmost", True)
-    tk.Label(root, text=text, fg="#FEF2F2", bg="#7F1D1D", font=("Monospace", 11, "bold"), justify="left", padx=20, pady=16).pack()
-    tk.Button(root, text="Acknowledge", command=root.destroy, bg="#DC2626", fg="white", padx=16, pady=6).pack(pady=(0, 14))
-
-    def _keep_top():
-        root.attributes("-topmost", True)
-        root.after(500, _keep_top)
-
-    root.after(500, _keep_top)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--popup":
-        popup_main(sys.argv[2])
 `;
 
 const DASHBOARD_PY = `"""
 Textual terminal dashboard for Tamper Blocker.
-Views (Left/Right): All Logs -> per-user -> per-file -> ALERTS.
-Keys: Left/Right switch view, Up/Down scroll, / search, p pause/resume, a acknowledge all, q quit.
 """
 
 from __future__ import annotations
-
-import socket
 from collections import deque
 from datetime import datetime
-
+import socket
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Input, RichLog, Static
+from textual.widgets import Input, RichLog, Static
 
 
 class TamperDashboard(App):
@@ -884,14 +957,12 @@ class TamperDashboard(App):
     #search { display: none; }
     #search.open { display: block; }
     """
-
     BINDINGS = [
         Binding("left", "prev_view", "Prev View", priority=True),
         Binding("right", "next_view", "Next View", priority=True),
         Binding("slash", "open_search", "Search"),
         Binding("escape", "clear_search", "Clear"),
         Binding("p", "toggle_pause", "Pause"),
-        Binding("a", "ack_alerts", "Acknowledge"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -907,7 +978,7 @@ class TamperDashboard(App):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="topbar", classes="ok")
-        yield Input(placeholder="Filter logs (Enter apply, Esc clear)...", id="search")
+        yield Input(placeholder="Filter logs...", id="search")
         yield RichLog(id="log", max_lines=5000, markup=True)
 
     def on_mount(self) -> None:
@@ -918,87 +989,21 @@ class TamperDashboard(App):
         while not self.monitor.queue.empty():
             ev = self.monitor.queue.get_nowait()
             self.events.append(ev)
-            for candidate in (f"user:{ev.user}", f"file:{ev.file}"):
-                if candidate not in self.views:
-                    self.views.insert(-1, candidate)
             changed = True
-        self._update_topbar()
-        if changed and not self.paused:
-            self._render_view()
-
-    def _update_topbar(self) -> None:
         bar = self.query_one("#topbar", Static)
         k = self.alerts.unacknowledged
         bar.set_class(k == 0, "ok")
         bar.set_class(k > 0, "alert")
-        paused_str = " | PAUSED" if self.paused else ""
-        filt_str = f" | filter={self.search_term}" if self.search_term else ""
-        bar.update(
-            f"TAMPER BLOCKER | {socket.gethostname()} | {datetime.now():%Y-%m-%d %H:%M:%S} | "
-            f"files: {len(self.monitor.baselines)} | tamper alerts: {k} | view: {self.views[self.view_idx]}{paused_str}{filt_str}"
-        )
-
-    def _render_view(self) -> None:
-        log = self.query_one("#log", RichLog)
-        log.clear()
-        current = self.views[self.view_idx]
-        shown = 0
-        for ev in self.events:
-            if current == "ALERTS" and not ev.is_tamper:
-                continue
-            if current.startswith("user:") and ev.user != current[5:]:
-                continue
-            if current.startswith("file:") and ev.file != current[5:]:
-                continue
-            line = f"{ev.ts} [{ev.severity}] {ev.user} {ev.file}: {ev.message}"
-            if self.search_term and self.search_term.lower() not in line.lower():
-                continue
-            color = "bold red" if ev.severity == "CRIT" else ("yellow" if ev.severity == "WARN" else "white")
-            log.write(f"[{color}]{line}[/{color}]")
-            shown += 1
-        if shown == 0:
-            log.write("[dim]No events match the current view or filter yet.[/dim]")
-
-    def action_prev_view(self) -> None:
-        if self.query_one("#search", Input).has_focus:
-            return
-        self.view_idx = (self.view_idx - 1) % len(self.views)
-        self._render_view()
-
-    def action_next_view(self) -> None:
-        if self.query_one("#search", Input).has_focus:
-            return
-        self.view_idx = (self.view_idx + 1) % len(self.views)
-        self._render_view()
-
-    def action_open_search(self) -> None:
-        inp = self.query_one("#search", Input)
-        inp.add_class("open")
-        inp.focus()
-
-    def action_clear_search(self) -> None:
-        inp = self.query_one("#search", Input)
-        inp.value = ""
-        inp.remove_class("open")
-        self.search_term = ""
-        self._render_view()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.search_term = event.value.strip()
-        self.query_one("#log", RichLog).focus()
-        self._render_view()
-
-    def action_toggle_pause(self) -> None:
-        self.paused = not self.paused
-        self._update_topbar()
-
-    def action_ack_alerts(self) -> None:
-        self.alerts.unacknowledged = 0
-        self._update_topbar()
+        bar.update(f"TAMPER BLOCKER | {socket.gethostname()} | {datetime.now():%H:%M:%S} | tamper alerts: {k}")
+        if changed and not self.paused:
+            log = self.query_one("#log", RichLog)
+            log.clear()
+            for ev in self.events:
+                log.write(f"{ev.ts} [{ev.severity}] {ev.user} {ev.file}: {ev.message}")
 `;
 
 const SYSTEMD_SERVICE = `[Unit]
-Description=Tamper Blocker Real-Time Log Integrity Monitor
+Description=Tamperer & Tamper Blocker Real-Time Log Integrity Monitor
 After=auditd.service network.target
 
 [Service]
@@ -1014,7 +1019,7 @@ WantedBy=multi-user.target
 const INSTALL_SH = `#!/usr/bin/env bash
 set -euo pipefail
 
-# 1. Install Kali system dependencies (never mix unknown python3-textual apt names)
+# 1. Install Kali system dependencies
 sudo apt update
 sudo apt install -y auditd python3-pip python3-tk python3-yaml audispd-plugins \\
   libnotify-bin pulseaudio-utils sound-theme-freedesktop logrotate
@@ -1023,23 +1028,25 @@ sudo pip3 install --break-system-packages textual inotify_simple pyyaml
 
 # 2. Deploy application & chain storage directories
 sudo mkdir -p /opt/tamper_blocker /var/lib/tamper_blocker
-sudo cp tamper_blocker.py monitor.py alerts.py dashboard.py config.yaml /opt/tamper_blocker/
-sudo chmod +x /opt/tamper_blocker/tamper_blocker.py
+sudo cp tamper_blocker.py monitor.py alerts.py dashboard.py tamperer_gui.py tamperer-agent.py config.yaml /opt/tamper_blocker/
+sudo chmod +x /opt/tamper_blocker/tamper_blocker.py /opt/tamper_blocker/tamperer_gui.py /opt/tamper_blocker/tamperer-agent.py
 
-# 3. Install global 'tamplogs' terminal command
+# 3. Install global 'tamplogs' (CLI/TUI) and 'tamperer' (Burp-style Desktop App)
 sudo ln -sf /opt/tamper_blocker/tamper_blocker.py /usr/local/bin/tamplogs
+sudo ln -sf /opt/tamper_blocker/tamperer_gui.py /usr/local/bin/tamperer
+sudo cp tamperer.desktop /usr/share/applications/tamperer.desktop
 
 # 4. Install and start systemd service
 sudo cp tamper-blocker.service /etc/systemd/system/tamper-blocker.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now auditd tamper-blocker.service
 
-echo "Installed. Run 'sudo tamplogs' to launch the live terminal monitor."
+echo "Installed. Run 'tamperer' for the Burp-style GUI app or 'sudo tamplogs' for CLI/TUI."
 `;
 
 const TEST_SECTION12_SH = `#!/usr/bin/env bash
 set -euo pipefail
-echo "=== Tamper Blocker Section 12 Safe Test Plan ==="
+echo "=== Tamperer Section 12 Safe Test Plan ==="
 echo test | sudo tee -a /var/log/test.log
 echo AAAA | sudo tee -a /var/log/test.log
 sudo sed -i 's/test/EDIT/' /var/log/test.log
@@ -1056,10 +1063,31 @@ sudo ausearch -k log_tamper -i -c tee --start recent || true
 
 export const KALI_BUNDLE_FILES: KaliBundleFile[] = [
   {
-    name: 'tamper_blocker.py',
-    installPath: '/opt/tamper_blocker/tamper_blocker.py',
+    name: 'tamperer_gui.py',
+    installPath: '/usr/local/bin/tamperer',
     language: 'python',
-    description: 'CLI entrypoint (aliased to tamplogs) supporting --headless, --no-popup, --harden, --unharden, --verify.',
+    description: 'Desktop launcher invoked by typing "tamperer" in Kali (opens standalone Burp Suite-style window).',
+    content: TAMPERER_GUI_PY,
+  },
+  {
+    name: 'tamperer.desktop',
+    installPath: '/usr/share/applications/tamperer.desktop',
+    language: 'desktop',
+    description: 'Kali desktop menu entry so Tamperer appears alongside Burp Suite in Security Applications.',
+    content: TAMPERER_DESKTOP,
+  },
+  {
+    name: 'tamperer-agent.py',
+    installPath: '/opt/tamper_blocker/tamperer-agent.py',
+    language: 'python',
+    description: 'Standalone Wazuh-style Linux remote agent for Ubuntu/Debian/Kali nodes streaming logs & FIM to Manager.',
+    content: buildAgentPythonScript(),
+  },
+  {
+    name: 'tamper_blocker.py',
+    installPath: '/usr/local/bin/tamplogs',
+    language: 'python',
+    description: 'CLI/TUI entrypoint (aliased to tamplogs) supporting --headless, --no-popup, --harden, --verify.',
     content: TAMPER_BLOCKER_PY,
   },
   {
@@ -1073,21 +1101,21 @@ export const KALI_BUNDLE_FILES: KaliBundleFile[] = [
     name: 'alerts.py',
     installPath: '/opt/tamper_blocker/alerts.py',
     language: 'python',
-    description: 'SHA-256 ChainLog verifier, desktop notify-send/paplay/Tkinter popup impersonation, and remote syslog.',
+    description: 'SHA-256 ChainLog verifier and AlertManager.',
     content: ALERTS_PY,
   },
   {
     name: 'dashboard.py',
     installPath: '/opt/tamper_blocker/dashboard.py',
     language: 'python',
-    description: 'Textual TUI dashboard with dynamic per-user/per-file views, search, pause, and acknowledge.',
+    description: 'Textual TUI dashboard for terminal-only sessions.',
     content: DASHBOARD_PY,
   },
   {
     name: 'config.yaml',
     installPath: '/opt/tamper_blocker/config.yaml',
     language: 'yaml',
-    description: 'Paths, hash cap, inplace_ok exceptions, tail_skip for audit.log, harden list, and remote syslog.',
+    description: 'Manager & local monitor configuration.',
     content: DEFAULT_CONFIG_YAML,
   },
   {
@@ -1101,21 +1129,21 @@ export const KALI_BUNDLE_FILES: KaliBundleFile[] = [
     name: 'install.sh',
     installPath: './install.sh',
     language: 'bash',
-    description: 'Automated Kali Linux installer that configures dependencies, systemd, and the tamplogs command.',
+    description: 'Automated Kali installer configuring tamperer desktop command, tamplogs CLI, and systemd.',
     content: INSTALL_SH,
   },
   {
     name: 'test_section12.sh',
     installPath: './test_section12.sh',
     language: 'bash',
-    description: 'Full 10-step safe verification suite from Section 12 of the specification.',
+    description: '10-step safe verification script from Section 12.',
     content: TEST_SECTION12_SH,
   },
 ];
 
 function createTarHeader(filename: string, size: number, mode = 0o755): Buffer {
   const header = Buffer.alloc(512, 0);
-  const nameBuf = Buffer.from(`tamper_blocker/${filename}`, 'utf8');
+  const nameBuf = Buffer.from(`tamperer/${filename}`, 'utf8');
   nameBuf.copy(header, 0, 0, Math.min(nameBuf.length, 100));
   header.write(mode.toString(8).padStart(7, '0') + '\0', 100, 8, 'ascii');
   header.write('0000000\0', 108, 8, 'ascii');
@@ -1140,7 +1168,7 @@ export function buildKaliTarGz(): Buffer {
   const chunks: Buffer[] = [];
   for (const file of KALI_BUNDLE_FILES) {
     const contentBuf = Buffer.from(file.content, 'utf8');
-    const mode = file.name.endsWith('.sh') || file.name === 'tamper_blocker.py' ? 0o755 : 0o644;
+    const mode = file.name.endsWith('.sh') || file.name.endsWith('.py') ? 0o755 : 0o644;
     chunks.push(createTarHeader(file.name, contentBuf.length, mode));
     chunks.push(contentBuf);
     const remainder = contentBuf.length % 512;

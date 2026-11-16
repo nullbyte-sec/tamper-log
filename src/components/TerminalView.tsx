@@ -17,6 +17,7 @@ interface TerminalViewProps {
 }
 
 const COMMAND_SUGGESTIONS = [
+  'tamperer',
   'tamplogs',
   'tamplogs --verify',
   'tamplogs --status',
@@ -24,33 +25,31 @@ const COMMAND_SUGGESTIONS = [
   'tamplogs --unharden',
   'tamplogs --headless',
   'tamplogs --stop',
+  'ls -la /var/log',
+  'tail -n 20 /var/log/nginx/access.log',
+  'tail -n 20 /var/log/dpkg.log',
+  'stat /var/log/dpkg.log',
+  'lsattr /var/log/dpkg.log',
   'echo test | sudo tee -a /var/log/test.log',
   "sudo sed -i 's/test/EDIT/' /var/log/test.log",
   'sudo truncate -s 0 /var/log/test.log',
   'sudo chmod 777 /var/log/test.log',
   'sudo rm /var/log/test.log',
-  'sudo logrotate -f /etc/logrotate.conf',
-  'sudo systemctl stop rsyslog',
-  'sudo systemctl start rsyslog',
-  'sudo journalctl --vacuum-size=500M',
-  'sudo auditctl -l',
-  'sudo ausearch -k log_tamper -i -c tee --start recent',
-  'history -c',
-  'ls -la /var/log',
   'help',
 ];
 
 const QUICK_MACROS: Array<{ label: string; command: string; tone: 'primary' | 'safe' | 'warn' | 'danger' }> = [
+  { label: 'tamperer', command: 'tamperer', tone: 'primary' },
   { label: 'tamplogs', command: 'tamplogs', tone: 'primary' },
   { label: 'tamplogs --verify', command: 'tamplogs --verify', tone: 'safe' },
-  { label: 'Safe Append', command: 'echo "auth check ok" | sudo tee -a /var/log/test.log', tone: 'safe' },
+  { label: 'ls -la /var/log', command: 'ls -la /var/log', tone: 'safe' },
+  { label: 'tail nginx/access.log', command: 'tail -n 20 /var/log/nginx/access.log', tone: 'safe' },
+  { label: 'tail dpkg.log', command: 'tail -n 20 /var/log/dpkg.log', tone: 'safe' },
+  { label: 'Safe Append (test.log)', command: 'echo "test" | sudo tee -a /var/log/test.log', tone: 'safe' },
   { label: 'Tamper Edit (sed -i)', command: "sudo sed -i 's/test/EDIT/' /var/log/test.log", tone: 'danger' },
-  { label: 'Truncate Log', command: 'sudo truncate -s 0 /var/log/test.log', tone: 'danger' },
-  { label: 'chmod 777', command: 'sudo chmod 777 /var/log/test.log', tone: 'warn' },
-  { label: 'Delete Log (rm)', command: 'sudo rm /var/log/test.log', tone: 'danger' },
-  { label: 'Run Logrotate', command: 'sudo logrotate -f /etc/logrotate.conf', tone: 'safe' },
-  { label: 'Stop rsyslog', command: 'sudo systemctl stop rsyslog', tone: 'danger' },
-  { label: 'Journal Vacuum', command: 'sudo journalctl --vacuum-size=500M', tone: 'danger' },
+  { label: 'Truncate test.log', command: 'sudo truncate -s 0 /var/log/test.log', tone: 'danger' },
+  { label: 'chmod 777 test.log', command: 'sudo chmod 777 /var/log/test.log', tone: 'warn' },
+  { label: 'Delete test.log (rm)', command: 'sudo rm /var/log/test.log', tone: 'danger' },
 ];
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
@@ -60,16 +59,17 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   onStartMonitor,
   onStopMonitor,
 }) => {
+  const promptPrefix = `root@${status.hostname || 'localhost'}:~$`;
   const [lines, setLines] = useState<TerminalLine[]>([
     {
       id: 'init-1',
       kind: 'system',
-      text: 'Kali GNU/Linux Rolling (kali-sec 6.11.2-kali1-amd64) — Tamper Blocker Interactive Shell',
+      text: `${status.hostname || 'localhost'} (Linux ${status.kernel}) — Tamperer Real Host Shell`,
     },
     {
       id: 'init-2',
       kind: 'system',
-      text: "Type 'tamplogs' to launch real-time file integrity & log monitoring, or 'help' for all commands.",
+      text: "Type 'tamperer' or 'tamplogs' to monitor real /var/log files on this machine, or 'help' for available commands.",
     },
   ]);
   const [input, setInput] = useState('');
@@ -111,7 +111,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     setInput('');
     setBusy(true);
 
-    appendLines([{ kind: 'prompt', text: `kali@kali-sec:~$ ${trimmed}` }]);
+    appendLines([{ kind: 'prompt', text: `${promptPrefix} ${trimmed}` }]);
 
     const res = await onExecute(trimmed);
     setBusy(false);
@@ -249,7 +249,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           <div className="flex items-center justify-between px-4 py-2.5 bg-[#0E1522] border-b border-slate-800 text-xs text-slate-400">
             <div className="flex items-center gap-2 font-mono">
               <TerminalIcon className="w-3.5 h-3.5 text-sky-400" />
-              <span className="text-slate-200 font-medium">kali@kali-sec: ~</span>
+              <span className="text-slate-200 font-medium">root@{status.hostname || 'localhost'}: ~</span>
               <span aria-hidden="true">·</span>
               <span>bash</span>
             </div>
@@ -277,14 +277,14 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           </div>
 
           <div className="flex items-center gap-2 px-4 py-3 bg-[#0C121D] border-t border-slate-800 font-mono text-[13px]">
-            <span className="text-emerald-400 font-semibold shrink-0">kali@kali-sec:~$</span>
+            <span className="text-emerald-400 font-semibold shrink-0">{promptPrefix}</span>
             <input
               ref={inputRef}
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Type 'tamplogs' or any Kali log command..."
+              placeholder="Type 'tamperer', 'tamplogs', or any host command..."
               className="flex-1 bg-transparent text-slate-100 placeholder-slate-600 focus:outline-none"
               autoFocus
             />

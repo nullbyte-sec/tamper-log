@@ -1,31 +1,35 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Activity,
   CheckCheck,
   FileCode2,
   FlaskConical,
   HardDrive,
+  LayoutDashboard,
   Link2,
-  Menu,
   Play,
   RotateCcw,
   ScrollText,
+  Search,
+  Server,
   ShieldAlert,
   Square,
   Terminal,
   Volume2,
   VolumeX,
-  X,
 } from 'lucide-react';
+import { AgentsView } from './components/AgentsView';
 import { AlertsView } from './components/AlertsView';
 import { ChainsAuditView } from './components/ChainsAuditView';
+import { DashboardView } from './components/DashboardView';
 import { FimView } from './components/FimView';
 import { KaliSourceView } from './components/KaliSourceView';
 import { LogStreamView } from './components/LogStreamView';
+import { SplunkSearchView } from './components/SplunkSearchView';
 import { TamperPopup } from './components/TamperPopup';
 import { TerminalView } from './components/TerminalView';
 import { TestPlanView } from './components/TestPlanView';
 import type {
+  AgentNode,
   AppSnapshot,
   BaselineRecord,
   ChainVerifyResult,
@@ -38,15 +42,25 @@ import type {
 } from './types/tamper';
 import { playTamperChime } from './utils/sound';
 
-type NavSection = 'terminal' | 'logs' | 'alerts' | 'fim' | 'chains' | 'tests' | 'source';
+type WorkbenchTab =
+  | 'dashboard'
+  | 'alerts'
+  | 'search'
+  | 'agents'
+  | 'logs'
+  | 'fim'
+  | 'terminal'
+  | 'chains'
+  | 'tests'
+  | 'source';
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
-  const [activeNav, setActiveNav] = useState<NavSection>('terminal');
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<WorkbenchTab>('dashboard');
+  const [selectedAgentId, setSelectedAgentId] = useState<string>('ALL');
+  const [splInitialQuery, setSplInitialQuery] = useState<string>('*');
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [popupDismissed, setPopupDismissed] = useState(false);
-  const [clockText, setClockText] = useState(() => new Date().toISOString().replace('T', ' ').slice(0, 19));
 
   const soundRef = useRef(soundEnabled);
   soundRef.current = soundEnabled;
@@ -55,8 +69,7 @@ export default function App() {
     try {
       const res = await fetch('/api/state');
       if (res.ok) {
-        const data = (await res.json()) as AppSnapshot;
-        setSnapshot(data);
+        setSnapshot((await res.json()) as AppSnapshot);
       }
     } catch {
       // ignore transient network error
@@ -65,19 +78,19 @@ export default function App() {
 
   useEffect(() => {
     void fetchSnapshot();
-    const timer = setInterval(() => {
-      setClockText(new Date().toISOString().replace('T', ' ').slice(0, 19));
-    }, 1000);
-    return () => clearInterval(timer);
   }, [fetchSnapshot]);
 
-  // Real-time SSE connection
   useEffect(() => {
     const es = new EventSource('/api/stream');
 
     es.addEventListener('status', (e) => {
       const status = JSON.parse((e as MessageEvent).data) as MonitorStatus;
       setSnapshot((prev) => (prev ? { ...prev, status } : prev));
+    });
+
+    es.addEventListener('agents', (e) => {
+      const agents = JSON.parse((e as MessageEvent).data) as AgentNode[];
+      setSnapshot((prev) => (prev ? { ...prev, agents } : prev));
     });
 
     es.addEventListener('log', (e) => {
@@ -87,11 +100,8 @@ export default function App() {
         if (prev.logs.some((l) => l.id === ev.id)) return prev;
         return {
           ...prev,
-          logs: [ev, ...prev.logs].slice(0, 500),
-          status: {
-            ...prev.status,
-            totalEventsCount: prev.status.totalEventsCount + 1,
-          },
+          logs: [ev, ...prev.logs].slice(0, 800),
+          status: { ...prev.status, totalEventsCount: prev.status.totalEventsCount + 1 },
         };
       });
     });
@@ -102,14 +112,11 @@ export default function App() {
       setSnapshot((prev) => {
         if (!prev) return prev;
         const already = prev.alerts.some((a) => a.id === alert.id);
-        const nextAlerts = already ? prev.alerts : [alert, ...prev.alerts].slice(0, 200);
+        const nextAlerts = already ? prev.alerts : [alert, ...prev.alerts].slice(0, 300);
         if (!already && prev.status.mode === 'interactive' && soundRef.current) {
           playTamperChime();
         }
-        return {
-          ...prev,
-          alerts: nextAlerts,
-        };
+        return { ...prev, alerts: nextAlerts };
       });
     });
 
@@ -136,9 +143,7 @@ export default function App() {
       setSnapshot((prev) => (prev ? { ...prev, chainVerify } : prev));
     });
 
-    return () => {
-      es.close();
-    };
+    return () => es.close();
   }, []);
 
   const handleExecuteCommand = async (command: string): Promise<TerminalExecResult | null> => {
@@ -167,26 +172,12 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: 'interactive' }),
     });
-    if (res.ok) {
-      setSnapshot((await res.json()) as AppSnapshot);
-    }
+    if (res.ok) setSnapshot((await res.json()) as AppSnapshot);
   };
 
   const handleStopMonitor = async () => {
     const res = await fetch('/api/monitor/stop', { method: 'POST' });
-    if (res.ok) {
-      setSnapshot((await res.json()) as AppSnapshot);
-    }
-  };
-
-  const handleToggleLiveNoise = async () => {
-    if (!snapshot) return;
-    await fetch('/api/monitor/noise', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: !snapshot.status.liveNoiseEnabled }),
-    });
-    void fetchSnapshot();
+    if (res.ok) setSnapshot((await res.json()) as AppSnapshot);
   };
 
   const handleAcknowledge = async (id: string) => {
@@ -212,10 +203,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
     });
-    if (res.ok) {
-      const data = (await res.json()) as { snapshot: AppSnapshot };
-      setSnapshot(data.snapshot);
-    }
+    if (res.ok) setSnapshot(((await res.json()) as { snapshot: AppSnapshot }).snapshot);
   };
 
   const handleUnharden = async (paths?: string[]) => {
@@ -224,10 +212,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
     });
-    if (res.ok) {
-      const data = (await res.json()) as { snapshot: AppSnapshot };
-      setSnapshot(data.snapshot);
-    }
+    if (res.ok) setSnapshot(((await res.json()) as { snapshot: AppSnapshot }).snapshot);
   };
 
   const handleRebaseline = async (path: string) => {
@@ -236,10 +221,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path }),
     });
-    if (res.ok) {
-      const data = (await res.json()) as { snapshot: AppSnapshot };
-      setSnapshot(data.snapshot);
-    }
+    if (res.ok) setSnapshot(((await res.json()) as { snapshot: AppSnapshot }).snapshot);
   };
 
   const handleVerifyChains = async () => {
@@ -249,15 +231,11 @@ export default function App() {
 
   const handleCorruptDemo = async () => {
     const res = await fetch('/api/chains/corrupt-demo', { method: 'POST' });
-    if (res.ok) {
-      const data = (await res.json()) as { snapshot: AppSnapshot };
-      setSnapshot(data.snapshot);
-    }
+    if (res.ok) setSnapshot(((await res.json()) as { snapshot: AppSnapshot }).snapshot);
   };
 
   const handleToggleService = async (svc: ServiceStatus['name'], currentlyActive: boolean) => {
-    const cmd = `sudo systemctl ${currentlyActive ? 'stop' : 'start'} ${svc}`;
-    await handleExecuteCommand(cmd);
+    await handleExecuteCommand(`sudo systemctl ${currentlyActive ? 'stop' : 'start'} ${svc}`);
   };
 
   const handleRunTestStep = async (step: number): Promise<TestStepResult | null> => {
@@ -277,6 +255,34 @@ export default function App() {
     if (res.ok) {
       setSnapshot((await res.json()) as AppSnapshot);
       setPopupDismissed(false);
+      setSelectedAgentId('ALL');
+    }
+  };
+
+  const handleEnrollAgent = async (name: string, ip: string, os: string): Promise<AgentNode | null> => {
+    const res = await fetch('/api/agents/enroll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, ip, os }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { agent: AgentNode; snapshot: AppSnapshot };
+    setSnapshot(data.snapshot);
+    return data.agent;
+  };
+
+  const handleAgentAction = async (
+    agentId: string,
+    action: 'toggle-status' | 'rebaseline',
+  ) => {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { snapshot: AppSnapshot };
+      setSnapshot(data.snapshot);
     }
   };
 
@@ -284,7 +290,7 @@ export default function App() {
     return (
       <div className="min-h-screen bg-[#0B0F17] flex items-center justify-center p-6">
         <div className="w-full max-w-md bg-[#111827] border border-slate-800 rounded-lg p-6 space-y-3">
-          <div className="h-5 w-40 bg-slate-800 rounded animate-pulse" />
+          <div className="h-5 w-44 bg-slate-800 rounded animate-pulse" />
           <div className="h-3 w-64 bg-slate-800/80 rounded animate-pulse" />
           <div className="h-3 w-52 bg-slate-800/60 rounded animate-pulse" />
         </div>
@@ -296,255 +302,249 @@ export default function App() {
   const unackedCount = unackedAlerts.length;
   const latestUnacked = unackedAlerts[0] ?? null;
 
-  const navItems: Array<{ id: NavSection; label: string; icon: React.ReactNode; badge?: number }> = [
-    { id: 'terminal', label: 'Terminal (tamplogs)', icon: <Terminal className="w-4 h-4" /> },
-    { id: 'logs', label: 'All Logs Stream', icon: <ScrollText className="w-4 h-4" /> },
-    { id: 'alerts', label: 'Tamper Alerts', icon: <ShieldAlert className="w-4 h-4" />, badge: unackedCount },
-    { id: 'fim', label: 'File Integrity', icon: <HardDrive className="w-4 h-4" /> },
-    { id: 'chains', label: 'Hash Chains & Auditd', icon: <Link2 className="w-4 h-4" /> },
-    { id: 'tests', label: 'Safe Test Plan', icon: <FlaskConical className="w-4 h-4" /> },
-    { id: 'source', label: 'Kali Linux Source', icon: <FileCode2 className="w-4 h-4" /> },
+  const tabs: Array<{ id: WorkbenchTab; label: string; icon: React.ReactNode; badge?: number }> = [
+    { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard className="w-3.5 h-3.5" /> },
+    { id: 'alerts', label: 'Live Alerts', icon: <ShieldAlert className="w-3.5 h-3.5" />, badge: unackedCount },
+    { id: 'search', label: 'Search & SPL', icon: <Search className="w-3.5 h-3.5" /> },
+    { id: 'agents', label: 'Agents', icon: <Server className="w-3.5 h-3.5" /> },
+    { id: 'logs', label: 'Log Stream', icon: <ScrollText className="w-3.5 h-3.5" /> },
+    { id: 'fim', label: 'File Integrity', icon: <HardDrive className="w-3.5 h-3.5" /> },
+    { id: 'terminal', label: 'Terminal', icon: <Terminal className="w-3.5 h-3.5" /> },
+    { id: 'chains', label: 'Audit & Chains', icon: <Link2 className="w-3.5 h-3.5" /> },
+    { id: 'tests', label: 'Test Plan', icon: <FlaskConical className="w-3.5 h-3.5" /> },
+    { id: 'source', label: 'Kali App (tamperer)', icon: <FileCode2 className="w-3.5 h-3.5" /> },
   ];
 
-  const sectionTitles: Record<NavSection, string> = {
-    terminal: 'Interactive Terminal · tamplogs',
-    logs: 'Unified Log Stream · All Logs',
-    alerts: 'Tamper Alerts & Acknowledgement',
-    fim: 'File Integrity Baseline Inventory',
-    chains: 'Hash Chains & Kernel Auditd',
-    tests: 'Section 12 Safe Verification Suite',
-    source: 'Kali Linux Python 3.14 Deployment',
-  };
-
   return (
-    <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex">
-      {/* Mobile Sidebar Backdrop */}
-      {mobileMenuOpen && (
-        <div
-          className="fixed inset-0 bg-black/60 z-30 lg:hidden"
-          onClick={() => setMobileMenuOpen(false)}
-        />
-      )}
-
-      {/* Left Sidebar (252px) */}
-      <aside
-        className={`fixed lg:static inset-y-0 left-0 z-40 w-[252px] shrink-0 bg-[#0E1522] border-r border-slate-800 flex flex-col transition-transform duration-200 ${
-          mobileMenuOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
+    <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex flex-col">
+      {/* Top Workbench Header — Turns crimson when unacknowledged tamper alerts > 0 */}
+      <header
+        className={`h-13 px-4 lg:px-6 border-b flex items-center justify-between gap-4 transition-colors ${
+          unackedCount > 0
+            ? 'bg-[#7F1D1D] border-red-700 text-red-50'
+            : 'bg-[#0E1522] border-slate-800 text-slate-100'
         }`}
       >
-        <div className="h-14 px-5 border-b border-slate-800 flex items-center justify-between">
-          <span className="text-base font-bold tracking-tight text-slate-100 whitespace-nowrap">
-            Tamper Blocker
+        <div className="flex items-center gap-4 min-w-0">
+          <span className="text-base font-bold tracking-tight whitespace-nowrap shrink-0">
+            Tamperer
           </span>
-          <button
-            type="button"
-            onClick={() => setMobileMenuOpen(false)}
-            className="lg:hidden text-slate-400 hover:text-slate-200 p-1"
-            aria-label="Close navigation"
-          >
-            <X className="w-4 h-4" />
-          </button>
+
+          <div className="hidden md:flex items-center gap-2 text-xs font-mono tabular-nums whitespace-nowrap">
+            <span className="text-slate-400">scope:</span>
+            <select
+              value={selectedAgentId}
+              onChange={(e) => setSelectedAgentId(e.target.value)}
+              aria-label="Scope by Linux host"
+              className="bg-[#080C12]/80 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-slate-100 focus:outline-none"
+            >
+              <option value="ALL">All Linux Hosts ({snapshot.agents.length})</option>
+              {snapshot.agents.map((ag) => (
+                <option key={ag.id} value={ag.id}>
+                  {ag.hostname} ({ag.ip})
+                </option>
+              ))}
+            </select>
+            <span aria-hidden="true" className="text-slate-500">·</span>
+            <span>agents: {snapshot.status.activeAgentsCount}/{snapshot.status.totalAgentsCount}</span>
+            <span aria-hidden="true">·</span>
+            <span>files: {snapshot.status.watchedFilesCount}</span>
+            <span aria-hidden="true">·</span>
+            <span className={unackedCount > 0 ? 'font-bold text-white' : 'text-emerald-400'}>
+              tamper alerts: {unackedCount}
+            </span>
+          </div>
         </div>
 
-        <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
-          {navItems.map((item) => {
-            const active = activeNav === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => {
-                  setActiveNav(item.id);
-                  setMobileMenuOpen(false);
-                }}
-                className={`w-full flex items-center justify-between px-3 py-2.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                  active
-                    ? 'bg-sky-600/20 text-sky-200 border border-sky-600/50'
-                    : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800/50 border border-transparent'
-                }`}
-              >
-                <span className="flex items-center gap-2.5 truncate">
-                  {item.icon}
-                  <span className="truncate">{item.label}</span>
-                </span>
-                {item.badge !== undefined && item.badge > 0 && (
-                  <span className="font-mono text-xs font-bold text-red-400 tabular-nums">
-                    {item.badge}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* Bottom Workspace Controls */}
-        <div className="p-3 border-t border-slate-800 space-y-1.5 text-xs">
+        <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={() => setSoundEnabled((s) => !s)}
-            className="w-full flex items-center justify-between px-3 py-2 rounded-md text-slate-300 hover:bg-slate-800/60 transition-colors"
+            className="p-1.5 rounded bg-black/25 hover:bg-black/40 border border-white/10 text-slate-200 transition-colors"
+            title={soundEnabled ? 'Mute alert chime' : 'Enable alert chime'}
+            aria-label="Toggle alert sound"
           >
-            <span className="flex items-center gap-2">
-              {soundEnabled ? <Volume2 className="w-3.5 h-3.5 text-sky-400" /> : <VolumeX className="w-3.5 h-3.5 text-slate-500" />}
-              Alert Chime
-            </span>
-            <span className="font-mono text-slate-400">{soundEnabled ? 'On' : 'Off'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => void handleToggleLiveNoise()}
-            className="w-full flex items-center justify-between px-3 py-2 rounded-md text-slate-300 hover:bg-slate-800/60 transition-colors"
-          >
-            <span className="flex items-center gap-2">
-              <Activity className="w-3.5 h-3.5 text-slate-400" />
-              Daemon Feed
-            </span>
-            <span className="font-mono text-slate-400">{snapshot.status.liveNoiseEnabled ? 'Live' : 'Quiet'}</span>
+            {soundEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5 text-slate-400" />}
           </button>
 
           <button
             type="button"
             onClick={() => void handleResetSandbox()}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors"
+            className="p-1.5 rounded bg-black/25 hover:bg-black/40 border border-white/10 text-slate-300 transition-colors"
+            title="Reset baselines & clean /var/log/test.log"
+            aria-label="Reset baselines & clean /var/log/test.log"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            Reset Kali Sandbox
           </button>
-        </div>
-      </aside>
 
-      {/* Main Content Area */}
-      <div className="flex-1 min-w-0 flex flex-col">
-        {/* Top Bar — Turns crimson when tamper alerts > 0 (Section 1 3-second takeaway) */}
-        <header
-          className={`h-14 px-4 lg:px-6 border-b flex items-center justify-between gap-4 transition-colors ${
-            unackedCount > 0
-              ? 'bg-[#7F1D1D] border-red-700 text-red-50'
-              : 'bg-[#0E1522] border-slate-800 text-slate-100'
-          }`}
-        >
-          <div className="flex items-center gap-3 min-w-0">
+          {unackedCount > 0 && (
             <button
               type="button"
-              onClick={() => setMobileMenuOpen(true)}
-              className="lg:hidden p-1.5 rounded hover:bg-white/10"
-              aria-label="Open navigation"
+              onClick={() => void handleAcknowledgeAll()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-red-600 hover:bg-red-500 text-white border border-red-400/40 transition-colors whitespace-nowrap shrink-0"
             >
-              <Menu className="w-4 h-4" />
+              <CheckCheck className="w-3.5 h-3.5" />
+              Acknowledge ({unackedCount})
             </button>
-            <h1 className="text-sm font-semibold truncate">{sectionTitles[activeNav]}</h1>
-            <span aria-hidden="true" className="hidden md:inline text-slate-500">·</span>
-            <div className="hidden md:flex items-center gap-2 text-xs font-mono tabular-nums whitespace-nowrap">
-              <span>{snapshot.status.hostname}</span>
-              <span aria-hidden="true">/</span>
-              <span>{clockText}</span>
-              <span aria-hidden="true">·</span>
-              <span>files: {snapshot.status.watchedFilesCount}</span>
-              <span aria-hidden="true">·</span>
-              <span className={unackedCount > 0 ? 'font-bold text-white' : 'text-emerald-400'}>
-                tamper alerts: {unackedCount}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 shrink-0">
-            {unackedCount > 0 && (
-              <button
-                type="button"
-                onClick={() => void handleAcknowledgeAll()}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-red-600 hover:bg-red-500 text-white border border-red-400/40 transition-colors whitespace-nowrap shrink-0"
-              >
-                <CheckCheck className="w-3.5 h-3.5" />
-                Acknowledge ({unackedCount})
-              </button>
-            )}
-
-            {snapshot.status.active ? (
-              <button
-                type="button"
-                onClick={() => void handleStopMonitor()}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900/70 hover:bg-slate-900 text-slate-100 border border-slate-700 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Square className="w-3.5 h-3.5 text-red-400" />
-                Stop Monitor
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => void handleStartMonitor()}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-md bg-sky-600 hover:bg-sky-500 text-white transition-colors whitespace-nowrap shrink-0"
-              >
-                <Play className="w-3.5 h-3.5" />
-                Start tamplogs
-              </button>
-            )}
-          </div>
-        </header>
-
-        {/* Active View Viewport */}
-        <main className="flex-1 p-4 lg:p-6 overflow-y-auto max-w-[1440px] w-full mx-auto">
-          {activeNav === 'terminal' && (
-            <TerminalView
-              status={snapshot.status}
-              liveLogs={snapshot.logs}
-              onExecute={handleExecuteCommand}
-              onStartMonitor={handleStartMonitor}
-              onStopMonitor={handleStopMonitor}
-            />
           )}
 
-          {activeNav === 'logs' && (
-            <LogStreamView
-              logs={snapshot.logs}
-              monitoringActive={snapshot.status.active}
-              onStartMonitor={handleStartMonitor}
-            />
+          {snapshot.status.active ? (
+            <button
+              type="button"
+              onClick={() => void handleStopMonitor()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900/80 hover:bg-slate-900 text-slate-100 border border-slate-700 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Square className="w-3.5 h-3.5 text-red-400" />
+              Stop Monitor
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void handleStartMonitor()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-sky-600 hover:bg-sky-500 text-white transition-colors whitespace-nowrap shrink-0"
+            >
+              <Play className="w-3.5 h-3.5" />
+              Start Monitor
+            </button>
           )}
+        </div>
+      </header>
 
-          {activeNav === 'alerts' && (
-            <AlertsView
-              alerts={snapshot.alerts}
-              onAcknowledge={handleAcknowledge}
-              onAcknowledgeAll={handleAcknowledgeAll}
-              onJumpToTerminal={() => setActiveNav('terminal')}
-            />
-          )}
+      {/* Burp Suite-Style Horizontal Workbench Tab Bar */}
+      <nav
+        aria-label="Tamperer Workbench Tabs"
+        className="bg-[#0B0F17] border-b border-slate-800 px-4 lg:px-6 flex items-center gap-1 overflow-x-auto"
+      >
+        {tabs.map((tab) => {
+          const active = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+              className={`inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+                active
+                  ? 'border-sky-500 text-slate-100 bg-[#111827]/70'
+                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/40'
+              }`}
+            >
+              {tab.icon}
+              <span>{tab.label}</span>
+              {tab.badge !== undefined && tab.badge > 0 && (
+                <span className="font-mono text-[11px] font-bold text-red-400 tabular-nums">
+                  ({tab.badge})
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </nav>
 
-          {activeNav === 'fim' && (
-            <FimView
-              baselines={snapshot.baselines}
-              onHarden={handleHarden}
-              onUnharden={handleUnharden}
-              onRebaseline={handleRebaseline}
-            />
-          )}
+      {/* Main Workbench Viewport */}
+      <main className="flex-1 p-4 lg:p-6 max-w-[1440px] w-full mx-auto">
+        {activeTab === 'dashboard' && (
+          <DashboardView
+            status={snapshot.status}
+            agents={snapshot.agents}
+            logs={snapshot.logs}
+            alerts={snapshot.alerts}
+            baselines={snapshot.baselines}
+            selectedAgentId={selectedAgentId}
+            onSelectAgent={setSelectedAgentId}
+            onAcknowledge={handleAcknowledge}
+            onAcknowledgeAll={handleAcknowledgeAll}
+            onStartMonitor={handleStartMonitor}
+            onNavigate={(t) => setActiveTab(t)}
+            onRunQuickSpl={(q) => {
+              setSplInitialQuery(q);
+              setActiveTab('search');
+            }}
+          />
+        )}
 
-          {activeNav === 'chains' && (
-            <ChainsAuditView
-              chainVerify={snapshot.chainVerify}
-              recentAlertChain={snapshot.recentAlertChain}
-              recentMirrorChain={snapshot.recentMirrorChain}
-              auditRules={snapshot.auditRules}
-              services={snapshot.services}
-              onVerifyChains={handleVerifyChains}
-              onCorruptDemo={handleCorruptDemo}
-              onToggleService={handleToggleService}
-            />
-          )}
+        {activeTab === 'alerts' && (
+          <AlertsView
+            alerts={snapshot.alerts}
+            selectedAgentId={selectedAgentId}
+            onAcknowledge={handleAcknowledge}
+            onAcknowledgeAll={handleAcknowledgeAll}
+            onJumpToTerminal={() => setActiveTab('terminal')}
+          />
+        )}
 
-          {activeNav === 'tests' && (
-            <TestPlanView
-              onRunStep={handleRunTestStep}
-              onResetSandbox={handleResetSandbox}
-            />
-          )}
+        {activeTab === 'search' && (
+          <SplunkSearchView
+            initialQuery={splInitialQuery}
+            onPivotToHost={(agentId) => {
+              setSelectedAgentId(agentId);
+              setActiveTab('dashboard');
+            }}
+          />
+        )}
 
-          {activeNav === 'source' && <KaliSourceView />}
-        </main>
-      </div>
+        {activeTab === 'agents' && (
+          <AgentsView
+            agents={snapshot.agents}
+            selectedAgentId={selectedAgentId}
+            onSelectAgent={setSelectedAgentId}
+            onEnrollAgent={handleEnrollAgent}
+            onAgentAction={handleAgentAction}
+          />
+        )}
 
-      {/* Persistent Tamper Alert Popup (Section 8) */}
+        {activeTab === 'logs' && (
+          <LogStreamView
+            logs={snapshot.logs}
+            monitoringActive={snapshot.status.active}
+            selectedAgentId={selectedAgentId}
+            onStartMonitor={handleStartMonitor}
+          />
+        )}
+
+        {activeTab === 'fim' && (
+          <FimView
+            baselines={snapshot.baselines}
+            selectedAgentId={selectedAgentId}
+            onHarden={handleHarden}
+            onUnharden={handleUnharden}
+            onRebaseline={handleRebaseline}
+          />
+        )}
+
+        {activeTab === 'terminal' && (
+          <TerminalView
+            status={snapshot.status}
+            liveLogs={snapshot.logs}
+            onExecute={handleExecuteCommand}
+            onStartMonitor={handleStartMonitor}
+            onStopMonitor={handleStopMonitor}
+          />
+        )}
+
+        {activeTab === 'chains' && (
+          <ChainsAuditView
+            chainVerify={snapshot.chainVerify}
+            recentAlertChain={snapshot.recentAlertChain}
+            recentMirrorChain={snapshot.recentMirrorChain}
+            auditRules={snapshot.auditRules}
+            services={snapshot.services}
+            onVerifyChains={handleVerifyChains}
+            onCorruptDemo={handleCorruptDemo}
+            onToggleService={handleToggleService}
+          />
+        )}
+
+        {activeTab === 'tests' && (
+          <TestPlanView
+            onRunStep={handleRunTestStep}
+            onResetSandbox={handleResetSandbox}
+          />
+        )}
+
+        {activeTab === 'source' && <KaliSourceView />}
+      </main>
+
+      {/* Persistent Live Alert Popup (Section 8) */}
       {latestUnacked && !popupDismissed && snapshot.status.mode === 'interactive' && (
         <TamperPopup
           alert={latestUnacked}

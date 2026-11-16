@@ -15,17 +15,50 @@ export type DetectionRuleKind =
   | 'LOGGING_SERVICE_STOPPED'
   | 'AUDIT_RULES_REMOVED';
 
+export interface WazuhRuleMeta {
+  ruleId: string;
+  level: number;
+  mitreId: string;
+  mitreTactic: string;
+  description: string;
+}
+
+export interface AgentNode {
+  id: string;
+  name: string;
+  hostname: string;
+  ip: string;
+  os: string;
+  kernel: string;
+  version: string;
+  status: 'active' | 'disconnected' | 'pending';
+  isManager: boolean;
+  lastKeepAlive: string;
+  enrolledAt: string;
+  token: string;
+  watchedCount: number;
+  openAlerts: number;
+  eventsCount: number;
+  cpuLoad: string;
+  memUsed: string;
+}
+
 export interface LogEvent {
   id: string;
   ts: string;
   timeShort: string;
+  epochMs: number;
+  agentId: string;
+  host: string;
   severity: Severity;
   user: string;
   file: string;
-  source: 'inotify' | 'journald' | 'proc' | 'auditd' | 'service' | 'tamplogs';
+  source: 'inotify' | 'journald' | 'proc' | 'auditd' | 'service' | 'tamplogs' | 'agent';
   message: string;
   isTamper?: boolean;
   ruleKind?: DetectionRuleKind;
+  wazuhRuleId?: string;
+  mitreId?: string;
 }
 
 export interface TamperAlert {
@@ -33,7 +66,14 @@ export interface TamperAlert {
   seq: number;
   ts: string;
   timeShort: string;
+  epochMs: number;
+  agentId: string;
+  host: string;
   kind: DetectionRuleKind;
+  wazuhRuleId: string;
+  ruleLevel: number;
+  mitreId: string;
+  mitreTactic: string;
   severity: 'WARN' | 'CRIT';
   path: string;
   user: string;
@@ -50,6 +90,8 @@ export interface TamperAlert {
 }
 
 export interface BaselineRecord {
+  agentId: string;
+  host: string;
   path: string;
   category: 'system' | 'package' | 'web' | 'audit' | 'binary' | 'journal' | 'history' | 'chain';
   exists: boolean;
@@ -91,6 +133,7 @@ export interface ChainRecord {
   ts: string;
   prev: string;
   hash: string;
+  host?: string;
   kind?: string;
   path?: string;
   user?: string;
@@ -120,6 +163,8 @@ export interface MonitorStatus {
   unacknowledgedCount: number;
   totalAlertsCount: number;
   totalEventsCount: number;
+  activeAgentsCount: number;
+  totalAgentsCount: number;
   auditRulesLoaded: boolean;
   logrotateRecent: boolean;
 }
@@ -144,8 +189,36 @@ export interface TestStepResult {
   durationMs: number;
 }
 
+export interface SplFieldFacet {
+  field: string;
+  values: Array<{ value: string; count: number }>;
+}
+
+export interface SplTimelineBucket {
+  label: string;
+  startMs: number;
+  endMs: number;
+  info: number;
+  warn: number;
+  crit: number;
+  total: number;
+}
+
+export interface SplQueryResult {
+  query: string;
+  timeRange: string;
+  totalMatched: number;
+  executionMs: number;
+  events: LogEvent[];
+  facets: SplFieldFacet[];
+  timeline: SplTimelineBucket[];
+  statsRows: Array<Record<string, string | number>> | null;
+  statsColumns: string[];
+}
+
 export interface AppSnapshot {
   status: MonitorStatus;
+  agents: AgentNode[];
   baselines: BaselineRecord[];
   logs: LogEvent[];
   alerts: TamperAlert[];
@@ -163,7 +236,7 @@ export interface AppSnapshot {
 export interface KaliBundleFile {
   name: string;
   installPath: string;
-  language: 'python' | 'yaml' | 'ini' | 'bash';
+  language: 'python' | 'yaml' | 'ini' | 'bash' | 'desktop';
   description: string;
   content: string;
 }

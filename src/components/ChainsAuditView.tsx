@@ -192,19 +192,28 @@ export const ChainsAuditView: React.FC<ChainsAuditViewProps> = ({
             </span>
           </div>
           <div className="p-4 space-y-2 font-mono text-xs max-h-[360px] overflow-auto">
-            {auditRules.map((r) => (
-              <div key={r.rule} className="p-2.5 bg-[#0B0F17] border border-slate-800 rounded space-y-1">
-                <div className="flex items-center justify-between">
-                  <span className={r.kind === 'never' ? 'text-amber-300 font-semibold' : 'text-sky-400 font-semibold'}>
-                    {r.kind === 'never' ? 'EXCLUDE (never,exit)' : `WATCH (${r.key ?? 'log_tamper'})`}
-                  </span>
-                  <span className={r.loaded ? 'text-emerald-400' : 'text-red-400'}>
-                    {r.loaded ? 'Loaded' : 'Missing'}
-                  </span>
-                </div>
-                <div className="text-slate-300 break-all">{r.rule}</div>
+            {auditRules.length === 0 ? (
+              <div className="p-4 bg-[#0B0F17] border border-slate-800 rounded text-slate-400 font-sans space-y-1">
+                <p className="text-slate-200 font-medium">No active kernel auditd rules detected</p>
+                <p>
+                  <code className="font-mono text-slate-300">auditctl</code> returned 0 loaded rules or is not installed on this host container. On a Kali Linux host, run <code className="font-mono text-sky-400">install.sh</code> to deploy <code className="font-mono text-slate-300">/etc/audit/rules.d/tamper_blocker.rules</code>.
+                </p>
               </div>
-            ))}
+            ) : (
+              auditRules.map((r) => (
+                <div key={r.rule} className="p-2.5 bg-[#0B0F17] border border-slate-800 rounded space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className={r.kind === 'never' ? 'text-amber-300 font-semibold' : 'text-sky-400 font-semibold'}>
+                      {r.kind === 'never' ? 'EXCLUDE (never,exit)' : `WATCH (${r.key ?? 'log_tamper'})`}
+                    </span>
+                    <span className={r.loaded ? 'text-emerald-400' : 'text-red-400'}>
+                      {r.loaded ? 'Loaded' : 'Missing'}
+                    </span>
+                  </div>
+                  <div className="text-slate-300 break-all">{r.rule}</div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>

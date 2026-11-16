@@ -4,6 +4,7 @@ import type { BaselineRecord } from '../types/tamper';
 
 interface FimViewProps {
   baselines: BaselineRecord[];
+  selectedAgentId: string;
   onHarden: (paths?: string[]) => Promise<void>;
   onUnharden: (paths?: string[]) => Promise<void>;
   onRebaseline: (path: string) => Promise<void>;
@@ -13,7 +14,7 @@ const CATEGORIES: Array<{ id: 'all' | BaselineRecord['category']; label: string 
   { id: 'all', label: 'All Files' },
   { id: 'system', label: 'System' },
   { id: 'package', label: 'APT / DPKG' },
-  { id: 'web', label: 'Apache / Nginx' },
+  { id: 'web', label: 'Web / DB' },
   { id: 'audit', label: 'Auditd' },
   { id: 'binary', label: 'Binary (wtmp/btmp)' },
   { id: 'journal', label: 'Journal' },
@@ -23,6 +24,7 @@ const CATEGORIES: Array<{ id: 'all' | BaselineRecord['category']; label: string 
 
 export const FimView: React.FC<FimViewProps> = ({
   baselines,
+  selectedAgentId,
   onHarden,
   onUnharden,
   onRebaseline,
@@ -42,11 +44,12 @@ export const FimView: React.FC<FimViewProps> = ({
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return baselines.filter((b) => {
+      if (selectedAgentId !== 'ALL' && b.agentId !== selectedAgentId) return false;
       if (category !== 'all' && b.category !== category) return false;
-      if (q && !b.path.toLowerCase().includes(q) && !b.digest.toLowerCase().includes(q)) return false;
+      if (q && !b.path.toLowerCase().includes(q) && !b.host.toLowerCase().includes(q) && !b.digest.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [baselines, category, query]);
+  }, [baselines, selectedAgentId, category, query]);
 
   const inspectFile = async (filePath: string) => {
     setInspectedPath(filePath);
@@ -64,13 +67,12 @@ export const FimView: React.FC<FimViewProps> = ({
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Toolbar */}
       <div className="bg-[#111827] border border-slate-800 rounded-lg p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-sm font-semibold text-slate-100">File Integrity Baseline Inventory</h2>
+            <h2 className="text-sm font-semibold text-slate-100">Multi-Host File Integrity Baseline Inventory</h2>
             <p className="text-xs text-slate-400 mt-0.5 tabular-nums">
-              {baselines.length} watched targets · SHA-256 prefix &amp; rolling chunk verification + inode/mode/uid/gid checks
+              {filtered.length} watched targets · SHA-256 prefix &amp; rolling chunk verification + inode/mode/uid/gid checks
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -117,20 +119,20 @@ export const FimView: React.FC<FimViewProps> = ({
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search path or SHA-256..."
+              placeholder="Search host, path, or SHA-256..."
               className="w-full pl-8 pr-3 py-1.5 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-md text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500"
             />
           </div>
         </div>
       </div>
 
-      {/* Data Table */}
       <div className="bg-[#111827] border border-slate-800 rounded-lg overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="bg-[#0E1522] border-b border-slate-800 text-slate-400 font-medium">
-                <th className="py-2.5 px-4">Path</th>
+                <th className="py-2.5 px-4">Host</th>
+                <th className="py-2.5 px-3">Path</th>
                 <th className="py-2.5 px-3">Integrity</th>
                 <th className="py-2.5 px-3 text-right">Size (B)</th>
                 <th className="py-2.5 px-3 text-right">Inode</th>
@@ -156,17 +158,15 @@ export const FimView: React.FC<FimViewProps> = ({
                       : b.status === 'rotated'
                         ? 'Rotated'
                         : 'Verified';
+                const isLocal = b.agentId === 'agent-000';
                 return (
-                  <tr key={b.path} className="hover:bg-slate-800/35 transition-colors">
-                    <td className="py-2.5 px-4 text-slate-200 max-w-[260px] truncate" title={b.path}>
-                      {b.path}
-                    </td>
+                  <tr key={`${b.agentId}::${b.path}`} className="hover:bg-slate-800/35 transition-colors">
+                    <td className="py-2.5 px-4 text-sky-400 whitespace-nowrap">{b.host}</td>
+                    <td className="py-2.5 px-3 text-slate-200 max-w-[240px] truncate" title={b.path}>{b.path}</td>
                     <td className={`py-2.5 px-3 font-sans ${statusColor}`}>{statusLabel}</td>
                     <td className="py-2.5 px-3 text-right text-slate-300 tabular-nums">{b.size.toLocaleString()}</td>
                     <td className="py-2.5 px-3 text-right text-slate-400 tabular-nums">{b.ino}</td>
-                    <td className="py-2.5 px-3 text-slate-400 whitespace-nowrap">
-                      {b.modeOctal} · {b.ownerLabel}
-                    </td>
+                    <td className="py-2.5 px-3 text-slate-400 whitespace-nowrap">{b.modeOctal} · {b.ownerLabel}</td>
                     <td className="py-2.5 px-3 whitespace-nowrap">
                       {b.hardened ? (
                         <span className="text-sky-400 font-semibold">+a</span>
@@ -177,35 +177,39 @@ export const FimView: React.FC<FimViewProps> = ({
                       )}
                     </td>
                     <td className="py-2.5 px-3 text-slate-400">
-                      {b.inplaceOk ? '(inplace_ok)' : b.digest ? `${b.digest.slice(0, 16)}…` : '--'}
+                      {b.inplaceOk ? '(inplace_ok)' : b.digest ? `${b.digest.slice(0, 14)}…` : '--'}
                     </td>
                     <td className="py-2.5 px-4 text-right">
-                      <div className="inline-flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => void inspectFile(b.path)}
-                          className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-                          title="Inspect file content"
-                        >
-                          <Eye className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void (b.hardened ? onUnharden([b.path]) : onHarden([b.path]))}
-                          className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-                          title={b.hardened ? 'Remove chattr +a' : 'Apply chattr +a'}
-                        >
-                          {b.hardened ? <Unlock className="w-3.5 h-3.5 text-amber-300" /> : <Lock className="w-3.5 h-3.5 text-sky-400" />}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void onRebaseline(b.path)}
-                          className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-                          title="Re-baseline SHA-256 & stat"
-                        >
-                          <RefreshCw className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
+                      {isLocal ? (
+                        <div className="inline-flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => void inspectFile(b.path)}
+                            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+                            title="Inspect file content"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void (b.hardened ? onUnharden([b.path]) : onHarden([b.path]))}
+                            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+                            title={b.hardened ? 'Remove chattr +a' : 'Apply chattr +a'}
+                          >
+                            {b.hardened ? <Unlock className="w-3.5 h-3.5 text-amber-300" /> : <Lock className="w-3.5 h-3.5 text-sky-400" />}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void onRebaseline(b.path)}
+                            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+                            title="Re-baseline SHA-256 & stat"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] font-sans text-slate-500">Remote agent</span>
+                      )}
                     </td>
                   </tr>
                 );
@@ -215,7 +219,6 @@ export const FimView: React.FC<FimViewProps> = ({
         </div>
       </div>
 
-      {/* File Content / Hex Inspector */}
       {inspectedPath && (
         <div className="bg-[#080C12] border border-slate-800 rounded-lg overflow-hidden">
           <div className="flex items-center justify-between px-4 py-2.5 bg-[#0E1522] border-b border-slate-800">
@@ -230,21 +233,12 @@ export const FimView: React.FC<FimViewProps> = ({
                 </>
               )}
             </div>
-            <button
-              type="button"
-              onClick={() => setInspectedPath(null)}
-              className="text-slate-400 hover:text-slate-200 p-1"
-              aria-label="Close inspector"
-            >
+            <button type="button" onClick={() => setInspectedPath(null)} className="text-slate-400 hover:text-slate-200 p-1">
               <X className="w-4 h-4" />
             </button>
           </div>
-          <div className="p-4 max-h-[260px] overflow-auto font-mono text-xs text-slate-300 whitespace-pre-wrap break-all">
-            {loadingInspect
-              ? 'Reading file from disk...'
-              : !inspectedData?.exists
-                ? 'File does not exist on disk (deleted or moved).'
-                : inspectedData.content || '(empty 0-byte file)'}
+          <div className="p-4 max-h-[240px] overflow-auto font-mono text-xs text-slate-300 whitespace-pre-wrap break-all">
+            {loadingInspect ? 'Reading file from disk...' : !inspectedData?.exists ? 'File missing on disk.' : inspectedData.content || '(empty 0-byte file)'}
           </div>
         </div>
       )}

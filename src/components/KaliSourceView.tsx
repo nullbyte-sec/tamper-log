@@ -37,19 +37,19 @@ export const KaliSourceView: React.FC = () => {
       {/* Header & Download */}
       <div className="bg-[#111827] border border-slate-800 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold text-slate-100">Kali Linux Python 3.14 GitHub Bundle (with tamplogs CLI)</h2>
+          <h2 className="text-sm font-semibold text-slate-100">Kali Linux App (tamperer) &amp; Multi-Agent Python Suite</h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            Includes all 13 Section 5 detection rules, SHA-256 ChainLog, Textual TUI, systemd unit, and Known Issues #1–#9 fixes.
+            Installs <code className="font-mono text-sky-400">tamperer</code> (Burp-style desktop GUI), <code className="font-mono text-sky-400">tamplogs</code> (CLI/TUI), and <code className="font-mono text-sky-400">tamperer-agent.py</code> for remote Linux nodes.
           </p>
         </div>
 
         <a
           href="/api/bundle/download"
-          download="tamper_blocker_kali.tar.gz"
+          download="tamperer_kali_suite.tar.gz"
           className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-md bg-sky-600 hover:bg-sky-500 text-white transition-colors whitespace-nowrap shrink-0"
         >
           <Download className="w-3.5 h-3.5" />
-          Download tamper_blocker_kali.tar.gz
+          Download tamperer_kali_suite.tar.gz
         </a>
       </div>
 
