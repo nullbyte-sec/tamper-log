@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 DEFAULT_URL = os.environ.get("TAMPERER_URL", "http://127.0.0.1:3000")
@@ -48,6 +49,10 @@ def wait_for_server(url: str, timeout: float = 8.0) -> bool:
             with urllib.request.urlopen(f"{url}/api/state", timeout=1.5) as resp:
                 if resp.status == 200:
                     return True
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return True
+            time.sleep(0.3)
         except Exception:
             time.sleep(0.3)
     return False

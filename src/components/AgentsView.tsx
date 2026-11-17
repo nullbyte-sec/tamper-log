@@ -6,7 +6,7 @@ interface AgentsViewProps {
   agents: AgentNode[];
   selectedAgentId: string;
   onSelectAgent: (agentId: string) => void;
-  onEnrollAgent: (name: string, ip: string, os: string) => Promise<AgentNode | null>;
+  onEnrollAgent: (name: string, ip: string, os: string) => Promise<{ agent: AgentNode | null; error?: string }>;
   onAgentAction: (agentId: string, action: 'toggle-status' | 'rebaseline') => Promise<void>;
 }
 
@@ -21,6 +21,7 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
   const [ip, setIp] = useState('');
   const [os, setOs] = useState('Ubuntu 24.04 LTS');
   const [enrolling, setEnrolling] = useState(false);
+  const [enrollError, setEnrollError] = useState<string | null>(null);
   const [deployedAgent, setDeployedAgent] = useState<AgentNode | null>(agents.find((a) => !a.isManager) ?? null);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
@@ -28,8 +29,12 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
     e.preventDefault();
     if (!name.trim()) return;
     setEnrolling(true);
-    const created = await onEnrollAgent(name.trim(), ip.trim() || '10.14.2.50', os.trim());
+    setEnrollError(null);
+    const { agent: created, error } = await onEnrollAgent(name.trim(), ip.trim() || '10.14.2.50', os.trim());
     setEnrolling(false);
+    if (error) {
+      setEnrollError(error);
+    }
     if (created) {
       setDeployedAgent(created);
       setName('');
@@ -38,14 +43,14 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
   };
 
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:3000';
-  const installOneLiner = deployedAgent
-    ? `curl -sSL "${origin}/api/agents/install.sh?agentId=${encodeURIComponent(deployedAgent.id)}&token=${encodeURIComponent(deployedAgent.token)}" | sudo bash`
+  const agentRunSnippet = deployedAgent
+    ? `sudo TAMPERER_MANAGER="${origin}" TAMPERER_AGENT_ID="${deployedAgent.id}" TAMPERER_TOKEN="${deployedAgent.token}" python3 /opt/tamper_blocker/tamperer-agent.py`
     : '';
 
   const handleCopy = async () => {
-    if (!installOneLiner) return;
+    if (!agentRunSnippet) return;
     try {
-      await navigator.clipboard.writeText(installOneLiner);
+      await navigator.clipboard.writeText(agentRunSnippet);
       setCopiedCmd(true);
       setTimeout(() => setCopiedCmd(false), 1800);
     } catch {
@@ -102,6 +107,12 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
             />
           </div>
 
+          {enrollError && (
+            <div className="text-xs font-mono text-red-300 bg-red-950/40 border border-red-800/60 rounded px-3 py-2">
+              {enrollError}
+            </div>
+          )}
+
           <button
             type="submit"
             disabled={enrolling}
@@ -112,7 +123,7 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
           </button>
         </form>
 
-        {/* Agent Deployment One-Liner */}
+        {/* Hardened Agent Launch Configuration */}
         <div className="xl:col-span-7 bg-[#111827] border border-slate-800 rounded-lg p-5 flex flex-col justify-between gap-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
@@ -120,25 +131,23 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
                 Deploy Agent{deployedAgent ? ` · ${deployedAgent.hostname} (${deployedAgent.id})` : ''}
               </h2>
               <p className="text-xs text-slate-400 mt-0.5">
-                Run this command on the target Linux machine to install <code className="font-mono text-slate-300">tamperer-agent.service</code> and stream live logs &amp; tamper alerts.
+                Install the verified bundle (<code className="font-mono text-slate-300">tamperer_kali_suite.tar.gz</code>) on the target host, then launch <code className="font-mono text-slate-300">tamperer-agent.py</code> with environment credentials.
               </p>
             </div>
-            {deployedAgent && (
-              <a
-                href={`/api/agents/agent.py?agentId=${encodeURIComponent(deployedAgent.id)}&token=${encodeURIComponent(deployedAgent.token)}`}
-                download={`tamperer-agent-${deployedAgent.id}.py`}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors whitespace-nowrap"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download agent.py
-              </a>
-            )}
+            <a
+              href="/api/bundle/download"
+              download="tamperer_kali_suite.tar.gz"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Download Bundle (.tar.gz)
+            </a>
           </div>
 
           {deployedAgent ? (
             <div className="space-y-3">
               <div className="bg-[#080C12] border border-slate-800 rounded-md p-3 font-mono text-xs text-sky-300 break-all">
-                {installOneLiner}
+                {agentRunSnippet}
               </div>
               <div className="flex flex-wrap items-center justify-between gap-3 text-xs font-mono text-slate-400">
                 <span>
@@ -151,12 +160,12 @@ export const AgentsView: React.FC<AgentsViewProps> = ({
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-sans font-medium rounded bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-600/50 transition-colors"
                 >
                   {copiedCmd ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedCmd ? 'Copied Command' : 'Copy Install Command'}
+                  {copiedCmd ? 'Copied Command' : 'Copy Launch Command'}
                 </button>
               </div>
             </div>
           ) : (
-            <div className="text-xs text-slate-500">Enroll a remote Linux host on the left to generate its systemd installer &amp; token.</div>
+            <div className="text-xs text-slate-500">Enroll a remote Linux host on the left to generate its agent ID &amp; token.</div>
           )}
         </div>
       </div>

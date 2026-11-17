@@ -255,6 +255,10 @@ export interface AppSnapshot {
   recentAlertChain: ChainRecord[];
   recentMirrorChain: ChainRecord[];
   configYaml: string;
+  capabilities?: {
+    terminalEnabled: boolean;
+    demoActionsEnabled: boolean;
+  };
 }
 
 export interface KaliBundleFile {

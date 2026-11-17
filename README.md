@@ -14,12 +14,30 @@ downloadable Kali Linux suite (`tamperer`, `tamplogs`, and `tamperer-agent.py`).
 
 ## Part 1: Run the Web Workbench
 
+### Local Development (loopback only)
+
 ```bash
 git clone https://github.com/nullbyte-sec/tamper-log.git
 cd tamper-log
 node -v          # must be 20 or higher
 npm install --legacy-peer-deps
-npm run dev      # starts http://localhost:3000
+npm run dev      # starts on http://127.0.0.1:3000 (dev warning if TAMPERER_ADMIN_PASSWORD is unset)
+```
+
+### Authenticated / Production Mode
+
+In production (`NODE_ENV=production`) or whenever `TAMPERER_ADMIN_PASSWORD` (32–512 chars) is set, the server enforces HTTP Basic Auth (`username: admin`), strict `Host` and `Origin` checks, and auth failure rate limiting:
+
+```bash
+export TAMPERER_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+export TAMPERER_PUBLIC_ORIGIN="http://127.0.0.1:3000"
+export TAMPERER_BIND_HOST="127.0.0.1"
+# Optional opt-in toggles (keep 0 on real monitored hosts unless intentionally testing):
+# export TAMPERER_ENABLE_TERMINAL="1"
+# export TAMPERER_ENABLE_DEMO_ACTIONS="1"
+
+npm run build
+NODE_ENV=production npm start
 ```
 
 ### Fixing the ERESOLVE dependency conflict
@@ -52,21 +70,21 @@ npm run dev
 
 ## Part 2: Download the Kali Bundle
 
-Once the dev server is running (look for `Local: http://localhost:3000` or
-`Server listening on port 3000`), open a second terminal:
+Once the server is running (look for `Tamperer server running on http://127.0.0.1:3000`), open a second terminal:
 
 ```bash
 cd ~
-curl -v -o tamperer_kali_suite.tar.gz http://localhost:3000/api/bundle/download
+# If TAMPERER_ADMIN_PASSWORD is set, include -u admin:"$TAMPERER_ADMIN_PASSWORD":
+curl -f -u "admin:${TAMPERER_ADMIN_PASSWORD:-}" -o tamperer_kali_suite.tar.gz http://127.0.0.1:3000/api/bundle/download
 tar -tzf tamperer_kali_suite.tar.gz    # list contents first
 tar -xzf tamperer_kali_suite.tar.gz
 cd tamperer
 ```
 
-### Fixing "Connection refused" on localhost:3000
+### Fixing "Connection refused" on 127.0.0.1:3000
 
-This means the dev server isn't running. Go back to the first terminal and
-make sure `npm run dev` is still active, then retry the curl command.
+This means the server isn't running. Go back to the first terminal and
+make sure `npm run dev` (or `npm start`) is still active, then retry the curl command.
 
 ## Part 3: Install on Kali
 
@@ -80,7 +98,7 @@ chmod +x install.sh
 The installer:
 - Installs apt packages (auditd, python3-pip, python3-tk, python3-yaml, etc.)
 - Installs Python packages (textual, inotify_simple, pyyaml)
-- Copies scripts into `/opt/tamper_blocker/`
+- Copies scripts into `/opt/tamper_blocker/` (including `tamperer-agent.py`)
 - Creates `/usr/local/bin/tamplogs` and `/usr/local/bin/tamperer`
 - Enables `tamper-blocker.service`
 
@@ -98,7 +116,7 @@ pip install textual inotify_simple pyyaml
 
 Then re-run `./install.sh` or manually place the scripts.
 
-## Part 4: Usage
+## Part 4: Usage & Remote Agents
 
 ```bash
 tamperer                      # GUI window
@@ -106,6 +124,19 @@ sudo tamplogs                 # terminal UI
 sudo tamplogs --verify        # check hash chains
 sudo tamplogs --harden        # chattr +a on logs (skip at first)
 sudo tamplogs --unharden      # remove chattr +a before logrotate
+```
+
+### Remote Linux Agent (Wazuh Model)
+
+1. Enroll the remote host in the **Agents** tab to obtain its `TAMPERER_AGENT_ID` and `TAMPERER_TOKEN`.
+2. Install `tamperer_kali_suite.tar.gz` on the remote Linux host (or copy `/opt/tamper_blocker/tamperer-agent.py`).
+3. Launch the agent using environment variables so tokens never appear in URLs:
+
+```bash
+sudo TAMPERER_MANAGER="http://127.0.0.1:3000" \
+     TAMPERER_AGENT_ID="agent-001" \
+     TAMPERER_TOKEN="<generated-token>" \
+     python3 /opt/tamper_blocker/tamperer-agent.py
 ```
 
 ## Safe Testing
@@ -146,7 +177,7 @@ not just that a file changed.
 
 ### What you'll see
 
-On each alert card: `uid 1000 · bash → curl -o /var/log/test.log ... · tty /dev/pts/3 · cwd /home/kali`
+On each alert card: `uid 1000 · /usr/bin/curl → curl -o /var/log/test.log ... · tty /dev/pts/3 · cwd /home/kali`
 with an expandable full-argv panel.
 
 ### Important caveat
@@ -159,6 +190,6 @@ as a v2 feature.
 ## Cautions
 
 - `--harden` sets `chattr +a` on logs; logrotate can't rotate them until `--unharden` runs.
-- The Agents tab uses a `curl ... | sudo bash` installer — only use on hosts you own.
-- Keep the web app bound to localhost; don't expose port 3000 to a network.
-- The `POST /api/terminal/exec` endpoint runs commands on the host — keep it local.
+- Keep the web app bound to `127.0.0.1` behind a TLS reverse proxy if accessed remotely; HTTP Basic Auth does not encrypt traffic by itself.
+- Leave `TAMPERER_ENABLE_TERMINAL=0` and `TAMPERER_ENABLE_DEMO_ACTIONS=0` on real production hosts unless actively running drills.
+- See `SECURITY-HARDENING.md` for authentication and host/origin validation details.

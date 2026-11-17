@@ -27,6 +27,11 @@ export function createManagementGate(password: string, publicOrigin: string): Re
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') {
     throw new Error('TAMPERER_PUBLIC_ORIGIN must be an http(s) origin without credentials, path, query or fragment.');
   }
+
+  const AUTH_WINDOW_MS = 60_000;
+  const AUTH_MAX_FAILURES = 30;
+  const failureMap = new Map<string, { count: number; resetAt: number }>();
+
   return (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -44,16 +49,35 @@ export function createManagementGate(password: string, publicOrigin: string): Re
       next();
       return;
     }
+
+    const clientIp = req.ip || req.socket?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const record = failureMap.get(clientIp);
+    if (record && record.resetAt > now && record.count >= AUTH_MAX_FAILURES) {
+      res.setHeader('Retry-After', String(Math.ceil((record.resetAt - now) / 1000)));
+      res.status(429).json({ error: 'Too many authentication failures. Try again later.' });
+      return;
+    }
+
     const header = req.headers.authorization || '';
     let credentials = '';
     if (header.length <= 2048 && /^Basic [A-Za-z0-9+/]+={0,2}$/i.test(header)) {
       credentials = Buffer.from(header.slice(6), 'base64').toString('utf8');
     }
     if (!equalSecret(credentials, `admin:${password}`)) {
+      if (failureMap.size > 4096) failureMap.clear();
+      const prev = failureMap.get(clientIp);
+      if (!prev || prev.resetAt <= now) {
+        failureMap.set(clientIp, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+      } else {
+        prev.count += 1;
+      }
       res.setHeader('WWW-Authenticate', 'Basic realm="Tamperer", charset="UTF-8"');
       res.status(401).json({ error: 'Management authentication required' });
       return;
     }
+
+    failureMap.delete(clientIp);
     next();
   };
 }

@@ -146,6 +146,18 @@ export default function App() {
     return () => es.close();
   }, []);
 
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const readErrorMessage = async (res: Response, fallback: string): Promise<string> => {
+    try {
+      const payload = (await res.json()) as { error?: string };
+      if (payload?.error) return payload.error;
+    } catch {
+      // ignore parse failure
+    }
+    return `${fallback} (HTTP ${res.status})`;
+  };
+
   const handleExecuteCommand = async (command: string): Promise<TerminalExecResult | null> => {
     try {
       const res = await fetch('/api/terminal/exec', {
@@ -153,7 +165,10 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command }),
       });
-      if (!res.ok) return null;
+      if (!res.ok) {
+        const msg = await readErrorMessage(res, 'Terminal command rejected');
+        return { command, stdout: [], stderr: [msg], exitCode: res.status, cwd: '/', triggeredRules: [] };
+      }
       const data = (await res.json()) as { result: TerminalExecResult; snapshot: AppSnapshot };
       setSnapshot(data.snapshot);
       if (data.result.triggeredRules.length > 0 && data.snapshot.status.mode === 'interactive') {
@@ -230,12 +245,20 @@ export default function App() {
   };
 
   const handleCorruptDemo = async () => {
+    setActionError(null);
     const res = await fetch('/api/chains/corrupt-demo', { method: 'POST' });
-    if (res.ok) setSnapshot(((await res.json()) as { snapshot: AppSnapshot }).snapshot);
+    if (res.ok) {
+      setSnapshot(((await res.json()) as { snapshot: AppSnapshot }).snapshot);
+    } else {
+      setActionError(await readErrorMessage(res, 'Simulate chain edit failed'));
+    }
   };
 
   const handleToggleService = async (svc: ServiceStatus['name'], currentlyActive: boolean) => {
-    await handleExecuteCommand(`sudo systemctl ${currentlyActive ? 'stop' : 'start'} ${svc}`);
+    const res = await handleExecuteCommand(`sudo systemctl ${currentlyActive ? 'stop' : 'start'} ${svc}`);
+    if (res && res.exitCode !== 0 && res.stderr.length > 0) {
+      setActionError(res.stderr[0]);
+    }
   };
 
   const handleRunTestStep = async (step: number): Promise<TestStepResult | null> => {
@@ -244,31 +267,39 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ step }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const msg = await readErrorMessage(res, 'Test step failed');
+      return { step, name: `Step ${step}`, command: '', expected: '', passed: false, observed: msg, durationMs: 0 };
+    }
     const data = (await res.json()) as { result: TestStepResult; snapshot: AppSnapshot };
     setSnapshot(data.snapshot);
     return data.result;
   };
 
   const handleResetSandbox = async () => {
+    setActionError(null);
     const res = await fetch('/api/sandbox/reset', { method: 'POST' });
     if (res.ok) {
       setSnapshot((await res.json()) as AppSnapshot);
       setPopupDismissed(false);
       setSelectedAgentId('ALL');
+    } else {
+      setActionError(await readErrorMessage(res, 'Reset failed'));
     }
   };
 
-  const handleEnrollAgent = async (name: string, ip: string, os: string): Promise<AgentNode | null> => {
+  const handleEnrollAgent = async (name: string, ip: string, os: string): Promise<{ agent: AgentNode | null; error?: string }> => {
     const res = await fetch('/api/agents/enroll', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, ip, os }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      return { agent: null, error: await readErrorMessage(res, 'Agent enrollment failed') };
+    }
     const data = (await res.json()) as { agent: AgentNode; snapshot: AppSnapshot };
     setSnapshot(data.snapshot);
-    return data.agent;
+    return { agent: data.agent };
   };
 
   const handleAgentAction = async (
@@ -442,6 +473,15 @@ export default function App() {
 
       {/* Main Workbench Viewport */}
       <main className="flex-1 p-4 lg:p-6 max-w-[1440px] w-full mx-auto">
+        {actionError && (
+          <div className="mb-4 px-4 py-2.5 bg-amber-950/50 border border-amber-800/60 rounded-lg flex items-center justify-between gap-3 text-xs text-amber-200 font-mono">
+            <span>{actionError}</span>
+            <button type="button" onClick={() => setActionError(null)} className="text-amber-300 hover:text-white font-sans font-medium">
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {activeTab === 'dashboard' && (
           <DashboardView
             status={snapshot.status}
@@ -515,6 +555,7 @@ export default function App() {
           <TerminalView
             status={snapshot.status}
             liveLogs={snapshot.logs}
+            terminalEnabled={snapshot.capabilities?.terminalEnabled ?? false}
             onExecute={handleExecuteCommand}
             onStartMonitor={handleStartMonitor}
             onStopMonitor={handleStopMonitor}
@@ -528,6 +569,7 @@ export default function App() {
             recentMirrorChain={snapshot.recentMirrorChain}
             auditRules={snapshot.auditRules}
             services={snapshot.services}
+            demoActionsEnabled={snapshot.capabilities?.demoActionsEnabled ?? false}
             onVerifyChains={handleVerifyChains}
             onCorruptDemo={handleCorruptDemo}
             onToggleService={handleToggleService}
@@ -536,6 +578,7 @@ export default function App() {
 
         {activeTab === 'tests' && (
           <TestPlanView
+            demoActionsEnabled={snapshot.capabilities?.demoActionsEnabled ?? false}
             onRunStep={handleRunTestStep}
             onResetSandbox={handleResetSandbox}
           />

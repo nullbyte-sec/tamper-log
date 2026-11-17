@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
@@ -7,21 +8,58 @@ import { TriggerCorrelator } from './server/triggerCorrelator.ts';
 import { createManagementGate, validAgentCredentials } from './server/apiSecurity.ts';
 
 const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.TAMPERER_BIND_HOST || '127.0.0.1';
 const isProduction = process.env.NODE_ENV === 'production';
+
+function parseValidHttpUrl(raw?: string): URL | null {
+  if (!raw || raw === 'MY_APP_URL') return null;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const validAppUrl = parseValidHttpUrl(process.env.APP_URL);
+const isAiStudioPreview = !isProduction && validAppUrl !== null;
+const HOST = process.env.TAMPERER_BIND_HOST || (validAppUrl ? '0.0.0.0' : '127.0.0.1');
 
 async function bootstrap() {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', false);
-  const origin = process.env.TAMPERER_PUBLIC_ORIGIN || `http://127.0.0.1:${PORT}`;
-  app.use(createManagementGate(process.env.TAMPERER_ADMIN_PASSWORD || '', origin));
+  const origin = process.env.TAMPERER_PUBLIC_ORIGIN || validAppUrl?.origin || `http://127.0.0.1:${PORT}`;
+  const adminPassword = process.env.TAMPERER_ADMIN_PASSWORD || '';
+  if (isProduction || adminPassword) {
+    app.use(createManagementGate(adminPassword, origin));
+  } else {
+    console.warn(
+      `[tamperer] WARNING: TAMPERER_ADMIN_PASSWORD is not set; starting dev server without HTTP Basic Auth (bind=${HOST}:${PORT}). Set TAMPERER_ADMIN_PASSWORD (32-512 chars) for authenticated mode.`,
+    );
+    app.use((_req, res, next) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      if (!isAiStudioPreview) {
+        res.setHeader('X-Frame-Options', 'DENY');
+      }
+      next();
+    });
+  }
   app.use(express.json({ limit: '2mb', strict: true }));
   const engine = new TamperEngine(process.cwd());
   const correlator = new TriggerCorrelator(engine);
   correlator.start();
 
-  app.get('/api/state', (_req, res) => res.json(engine.getSnapshot()));
+  const buildSnapshot = () => ({
+    ...engine.getSnapshot(),
+    capabilities: {
+      terminalEnabled: process.env.TAMPERER_ENABLE_TERMINAL === '1',
+      demoActionsEnabled: process.env.TAMPERER_ENABLE_DEMO_ACTIONS === '1',
+    },
+  });
+
+  app.get('/api/state', (_req, res) => res.json(buildSnapshot()));
   app.get('/api/stream', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Connection', 'keep-alive');
@@ -38,8 +76,12 @@ async function bootstrap() {
     const name = typeof req.body?.name === 'string' ? req.body.name : '';
     const ip = typeof req.body?.ip === 'string' ? req.body.ip : '';
     const os = typeof req.body?.os === 'string' ? req.body.os : '';
-    const agent = engine.enrollAgent(name, ip, os);
-    res.json({ agent, snapshot: engine.getSnapshot() });
+    try {
+      const agent = engine.enrollAgent(name, ip, os);
+      res.json({ agent, snapshot: buildSnapshot() });
+    } catch (err) {
+      res.status(429).json({ error: (err as Error).message });
+    }
   });
   app.post('/api/agents/ingest', (req, res) => {
     if (!validAgentCredentials(req.body, (id) => engine.getAgentById(id))) {
@@ -68,11 +110,11 @@ async function bootstrap() {
     if (!['toggle-status', 'rebaseline'].includes(action)) { res.status(400).json({ error: 'Invalid agent action' }); return; }
     const result = engine.runAgentAction(req.params.id, action);
     if (!result.ok) { res.status(404).json({ error: 'Agent not found' }); return; }
-    res.json({ ...result, snapshot: engine.getSnapshot() });
+    res.json({ ...result, snapshot: buildSnapshot() });
   });
   // Disabled until installer inputs, transport and credential storage are hardened.
   app.get(['/api/agents/agent.py', '/api/agents/install.sh'], (_req, res) => {
-    res.status(410).json({ error: 'Agent downloads temporarily disabled during security hardening. Existing agents can still ingest with valid credentials.' });
+    res.status(410).json({ error: 'Agent downloads temporarily disabled during security hardening. Use tamperer-agent.py from the verified Kali bundle with TAMPERER_AGENT_ID and TAMPERER_TOKEN env vars.' });
   });
   app.post('/api/spl/query', (req, res) => {
     const query = typeof req.body?.query === 'string' ? req.body.query : '*';
@@ -80,56 +122,66 @@ async function bootstrap() {
     res.json(engine.runSplQuery(query, timeRange));
   });
   app.post('/api/terminal/exec', (req, res) => {
-    if (process.env.TAMPERER_ENABLE_TERMINAL !== '1') { res.status(403).json({ error: 'Terminal execution is disabled' }); return; }
+    if (process.env.TAMPERER_ENABLE_TERMINAL !== '1') {
+      res.status(403).json({ error: 'Terminal execution is disabled. Set TAMPERER_ENABLE_TERMINAL=1 in server env to enable host shell commands.' });
+      return;
+    }
     const command = typeof req.body?.command === 'string' ? req.body.command : '';
-    res.json({ result: engine.executeCommand(command), snapshot: engine.getSnapshot() });
+    res.json({ result: engine.executeCommand(command), snapshot: buildSnapshot() });
   });
   app.post('/api/monitor/start', (req, res) => {
     const mode = req.body?.mode === 'headless' || req.body?.mode === 'no-popup' ? req.body.mode : 'interactive';
-    engine.startMonitoring(mode); res.json(engine.getSnapshot());
+    engine.startMonitoring(mode); res.json(buildSnapshot());
   });
-  app.post('/api/monitor/stop', (_req, res) => { engine.stopMonitoring(); res.json(engine.getSnapshot()); });
+  app.post('/api/monitor/stop', (_req, res) => { engine.stopMonitoring(); res.json(buildSnapshot()); });
   app.post('/api/monitor/noise', (_req, res) => res.json({ status: engine.getStatus() }));
   app.post('/api/alerts/:id/ack', (req, res) => {
     const alert = engine.acknowledgeAlert(req.params.id);
     if (!alert) { res.status(404).json({ error: 'Alert not found' }); return; }
-    res.json({ alert, snapshot: engine.getSnapshot() });
+    res.json({ alert, snapshot: buildSnapshot() });
   });
-  app.post('/api/alerts/ack-all', (_req, res) => res.json({ acknowledged: engine.acknowledgeAll(), snapshot: engine.getSnapshot() }));
+  app.post('/api/alerts/ack-all', (_req, res) => res.json({ acknowledged: engine.acknowledgeAll(), snapshot: buildSnapshot() }));
   app.post('/api/files/harden', (req, res) => {
-    const paths = Array.isArray(req.body?.paths) ? req.body.paths as string[] : undefined;
-    res.json({ output: engine.hardenFiles(paths), snapshot: engine.getSnapshot() });
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter((p: unknown): p is string => typeof p === 'string') : undefined;
+    res.json({ output: engine.hardenFiles(paths), snapshot: buildSnapshot() });
   });
   app.post('/api/files/unharden', (req, res) => {
-    const paths = Array.isArray(req.body?.paths) ? req.body.paths as string[] : undefined;
-    res.json({ output: engine.unhardenFiles(paths), snapshot: engine.getSnapshot() });
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter((p: unknown): p is string => typeof p === 'string') : undefined;
+    res.json({ output: engine.unhardenFiles(paths), snapshot: buildSnapshot() });
   });
   app.post('/api/files/rebaseline', (req, res) => {
     const target = typeof req.body?.path === 'string' ? req.body.path : '';
+    const check = engine.isManagedPath(target);
+    if (!check.ok) { res.status(403).json({ error: check.reason || 'Path not permitted' }); return; }
     const baseline = engine.rebaselineFile(target);
     if (!baseline) { res.status(404).json({ error: 'File not found' }); return; }
-    res.json({ baseline, snapshot: engine.getSnapshot() });
+    res.json({ baseline, snapshot: buildSnapshot() });
   });
   app.get('/api/files/content', (req, res) => {
     const target = typeof req.query.path === 'string' ? req.query.path : '';
     if (!target) { res.status(400).json({ error: 'Missing path query parameter' }); return; }
-    res.json(engine.readFileContent(target));
+    const result = engine.readFileContent(target);
+    if (result.denied) { res.status(403).json({ error: result.error || 'Path not permitted' }); return; }
+    res.json(result);
   });
   app.post('/api/chains/verify', (_req, res) => res.json({
     alerts: engine.verifySingleChain('alerts.chain'), mirror: engine.verifySingleChain('mirror.chain'),
     recentAlertChain: engine.readChainTail('alerts.chain', 40), recentMirrorChain: engine.readChainTail('mirror.chain', 40),
   }));
   app.use(['/api/chains/corrupt-demo', '/api/test-plan/run', '/api/sandbox/reset'], (_req, res, next) => {
-    if (process.env.TAMPERER_ENABLE_DEMO_ACTIONS !== '1') { res.status(403).json({ error: 'Destructive demo actions are disabled' }); return; }
+    if (process.env.TAMPERER_ENABLE_DEMO_ACTIONS !== '1') {
+      res.status(403).json({ error: 'Destructive demo actions are disabled. Set TAMPERER_ENABLE_DEMO_ACTIONS=1 in server env to run test drills or resets.' });
+      return;
+    }
     next();
   });
-  app.post('/api/chains/corrupt-demo', (_req, res) => res.json({ corruptedLine: engine.corruptChainDemo().line, snapshot: engine.getSnapshot() }));
+  app.post('/api/chains/corrupt-demo', (_req, res) => res.json({ corruptedLine: engine.corruptChainDemo().line, snapshot: buildSnapshot() }));
   app.post('/api/test-plan/run', (req, res) => {
     const step = Number(req.body?.step);
     if (!Number.isInteger(step) || step < 1 || step > 10) { res.status(400).json({ error: 'Step must be an integer between 1 and 10' }); return; }
-    res.json({ result: engine.runTestStep(step), snapshot: engine.getSnapshot() });
+    res.json({ result: engine.runTestStep(step), snapshot: buildSnapshot() });
   });
-  app.post('/api/sandbox/reset', (_req, res) => { engine.resetAll(); res.json(engine.getSnapshot()); });
+  app.post('/api/sandbox/reset', (_req, res) => { engine.resetAll(); res.json(buildSnapshot()); });
   app.get('/api/bundle/files', (_req, res) => res.json({ files: KALI_BUNDLE_FILES }));
   app.get('/api/bundle/download', (_req, res) => {
     res.setHeader('Content-Type', 'application/gzip');

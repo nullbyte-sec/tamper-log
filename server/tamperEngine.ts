@@ -193,10 +193,17 @@ function getLocalPrimaryIp(): string {
   return '127.0.0.1';
 }
 
+const MAX_REMOTE_AGENTS = 100;
+const MAX_REMOTE_BASELINES_PER_AGENT = 2000;
+const MAX_TAIL_READ_BYTES = 512 * 1024;
+const SHELL_HISTORY_RE = /^\/(?:root|home\/[A-Za-z0-9._-]+)\/\.[A-Za-z0-9]+_history$/;
+
 export class TamperEngine {
   private readonly chainDir: string;
+  private readonly realChainDir: string;
   private readonly alertChainPath: string;
   private readonly mirrorChainPath: string;
+  private readonly agentsPersistPath: string;
   private readonly hostname: string;
   private readonly osPretty: string;
   private readonly kernel: string;
@@ -244,8 +251,14 @@ export class TamperEngine {
       fs.mkdirSync(chosenDir, { recursive: true });
     }
     this.chainDir = chosenDir;
+    try {
+      this.realChainDir = fs.realpathSync(this.chainDir);
+    } catch {
+      this.realChainDir = path.posix.resolve(this.chainDir);
+    }
     this.alertChainPath = path.join(this.chainDir, 'alerts.chain');
     this.mirrorChainPath = path.join(this.chainDir, 'mirror.chain');
+    this.agentsPersistPath = path.join(this.chainDir, 'agents.json');
 
     // Clean up any legacy .tamper_sandbox folder if present
     const legacySandbox = path.join(workspaceDir, '.tamper_sandbox');
@@ -317,6 +330,82 @@ export class TamperEngine {
     }
   }
 
+  private resolveRealWithFallback(targetPath: string): string {
+    const resolved = path.posix.resolve(targetPath);
+    try {
+      return fs.realpathSync(resolved);
+    } catch {
+      const parent = path.posix.dirname(resolved);
+      const base = path.posix.basename(resolved);
+      try {
+        return path.posix.join(fs.realpathSync(parent), base);
+      } catch {
+        return resolved;
+      }
+    }
+  }
+
+  public isManagedPath(rawPath: string): { ok: boolean; resolved: string; reason?: string } {
+    if (typeof rawPath !== 'string' || rawPath.length === 0 || rawPath.length > 2048 || rawPath.includes('\0')) {
+      return { ok: false, resolved: '', reason: 'Invalid path' };
+    }
+    if (!path.posix.isAbsolute(rawPath)) {
+      return { ok: false, resolved: '', reason: 'Path must be absolute' };
+    }
+    const resolved = path.posix.resolve(rawPath);
+    const real = this.resolveRealWithFallback(resolved);
+
+    if (real === this.agentsPersistPath || real === path.posix.join(this.realChainDir, 'agents.json')) {
+      return { ok: false, resolved, reason: 'Access to credential store is denied' };
+    }
+
+    const inVarLog = real === '/var/log' || real.startsWith('/var/log/');
+    const inChainDir = real === this.realChainDir || real.startsWith(`${this.realChainDir}/`);
+    const isHistory = SHELL_HISTORY_RE.test(real);
+    const inBaselines = this.baselines.has(resolved) || this.baselines.has(real);
+
+    if (!inVarLog && !inChainDir && !isHistory && !inBaselines) {
+      return { ok: false, resolved, reason: 'Path is outside managed /var/log and tamper_blocker scope' };
+    }
+    return { ok: true, resolved: real };
+  }
+
+  private hashPrefixStream(filePath: string, maxBytes: number): { plen: number; digest: string } {
+    const hash = crypto.createHash('sha256');
+    const chunkBuf = Buffer.alloc(65536);
+    let total = 0;
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      while (total < maxBytes) {
+        const toRead = Math.min(chunkBuf.length, maxBytes - total);
+        const bytes = fs.readSync(fd, chunkBuf, 0, toRead, total);
+        if (bytes <= 0) break;
+        hash.update(chunkBuf.subarray(0, bytes));
+        total += bytes;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return { plen: total, digest: hash.digest('hex') };
+  }
+
+  private readRangeUtf8(filePath: string, startOffset: number, maxBytes: number): string {
+    if (maxBytes <= 0) return '';
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(maxBytes);
+      let readTotal = 0;
+      while (readTotal < maxBytes) {
+        const n = fs.readSync(fd, buf, readTotal, maxBytes - readTotal, startOffset + readTotal);
+        if (n <= 0) break;
+        readTotal += n;
+      }
+      return buf.subarray(0, readTotal).toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
   private computeBaseline(filePath: string): BaselineRecord | null {
     try {
       if (!fs.existsSync(filePath)) return null;
@@ -329,10 +418,10 @@ export class TamperEngine {
       let chunkCount = 0;
 
       if (!inplaceOk) {
-        const buf = fs.readFileSync(filePath);
-        plen = Math.min(buf.length, HASH_CAP_BYTES);
-        digest = sha256Hex(buf.subarray(0, plen));
-        chunkCount = buf.length > 0 ? Math.ceil(buf.length / CHUNK_SIZE_BYTES) : 0;
+        const hashed = this.hashPrefixStream(filePath, HASH_CAP_BYTES);
+        plen = hashed.plen;
+        digest = hashed.digest;
+        chunkCount = st.size > 0 ? Math.ceil(st.size / CHUNK_SIZE_BYTES) : 0;
       }
 
       const mode = st.mode & 0o7777;
@@ -371,7 +460,12 @@ export class TamperEngine {
         const full = path.posix.join(dirPath, entry.name);
         if (entry.isDirectory()) {
           this.walkDir(full, out);
-        } else if (entry.isFile() && !entry.name.includes('.sedtmp.')) {
+        } else if (
+          entry.isFile() &&
+          !entry.name.includes('.sedtmp.') &&
+          !entry.name.startsWith('.tamper_probe_') &&
+          entry.name !== 'agents.json'
+        ) {
           out.push(full);
         }
       }
@@ -543,6 +637,43 @@ export class TamperEngine {
     }
   }
 
+  private loadPersistedAgents(): AgentNode[] {
+    try {
+      if (!fs.existsSync(this.agentsPersistPath)) return [];
+      const raw = fs.readFileSync(this.agentsPersistPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (a): a is AgentNode =>
+          Boolean(a) &&
+          typeof a === 'object' &&
+          typeof a.id === 'string' &&
+          a.id !== 'agent-000' &&
+          !a.isManager &&
+          typeof a.token === 'string' &&
+          a.token.length > 0,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  private savePersistedAgents(): void {
+    try {
+      const remotes = this.agents.filter((a) => !a.isManager && a.id !== 'agent-000');
+      this.internalWritePaths.add(this.agentsPersistPath);
+      fs.writeFileSync(this.agentsPersistPath, JSON.stringify(remotes, null, 2), { encoding: 'utf8', mode: 0o600 });
+      try {
+        fs.chmodSync(this.agentsPersistPath, 0o600);
+      } catch {
+        // ignore if chmod unsupported
+      }
+      setTimeout(() => this.internalWritePaths.delete(this.agentsPersistPath), 150);
+    } catch {
+      this.internalWritePaths.delete(this.agentsPersistPath);
+    }
+  }
+
   private initMachineState(clearChains: boolean): void {
     if (clearChains) {
       fs.writeFileSync(this.alertChainPath, '', 'utf8');
@@ -555,27 +686,42 @@ export class TamperEngine {
     const loadAvg = os.loadavg()[0]?.toFixed(2) ?? '0.00';
     const memPct = `${Math.round(((os.totalmem() - os.freemem()) / Math.max(1, os.totalmem())) * 100)}%`;
 
-    this.agents = [
-      {
-        id: 'agent-000',
-        name: `${this.hostname} (Local Machine)`,
-        hostname: this.hostname,
-        ip: this.localIp,
-        os: this.osPretty,
-        kernel: this.kernel,
-        version: 'tamperer-local',
-        status: 'active',
-        isManager: true,
-        lastKeepAlive: nowIso(),
-        enrolledAt: nowIso(),
-        token: 'local-host',
-        watchedCount: 0,
-        openAlerts: 0,
-        eventsCount: 0,
-        cpuLoad: loadAvg,
-        memUsed: memPct,
-      },
-    ];
+    const localNode: AgentNode = {
+      id: 'agent-000',
+      name: `${this.hostname} (Local Machine)`,
+      hostname: this.hostname,
+      ip: this.localIp,
+      os: this.osPretty,
+      kernel: this.kernel,
+      version: 'tamperer-local',
+      status: 'active',
+      isManager: true,
+      lastKeepAlive: nowIso(),
+      enrolledAt: nowIso(),
+      token: 'local-host',
+      watchedCount: 0,
+      openAlerts: 0,
+      eventsCount: 0,
+      cpuLoad: loadAvg,
+      memUsed: memPct,
+    };
+
+    const persistedRemotes = clearChains ? [] : this.loadPersistedAgents();
+    if (clearChains) {
+      try {
+        if (fs.existsSync(this.agentsPersistPath)) fs.rmSync(this.agentsPersistPath, { force: true });
+      } catch {
+        // ignore
+      }
+    }
+    this.agents = [localNode, ...persistedRemotes];
+    let maxSeq = 0;
+    for (const ag of persistedRemotes) {
+      const m = ag.id.match(/^agent-(\d+)$/);
+      if (m) maxSeq = Math.max(maxSeq, Number(m[1]));
+    }
+    this.agentSeq = maxSeq;
+
     this.remoteBaselines.clear();
     this.alerts = [];
     this.alertSeq = 0;
@@ -1032,15 +1178,13 @@ export class TamperEngine {
       return triggered;
     }
 
-    let buf: Buffer;
-    try {
-      buf = fs.readFileSync(filePath);
-    } catch {
-      return triggered;
-    }
-
     if (!base.inplaceOk && base.plen > 0) {
-      const currentPrefixHash = sha256Hex(buf.subarray(0, base.plen));
+      let currentPrefixHash = '';
+      try {
+        currentPrefixHash = this.hashPrefixStream(filePath, base.plen).digest;
+      } catch {
+        return triggered;
+      }
       if (currentPrefixHash !== base.digest) {
         const isHist = filePath.includes('_history');
         const alert = this.fireTamperAlert({
@@ -1067,18 +1211,24 @@ export class TamperEngine {
     }
 
     if (st.size > base.size && !this.isBinaryFile(filePath) && filePath !== '/var/log/audit/audit.log' && filePath !== this.alertChainPath) {
-      const newText = buf.subarray(base.size).toString('utf8');
-      for (const line of newText.split('\n')) {
-        if (!line.trim()) continue;
-        this.pushLogEvent({
-          agentId: 'agent-000',
-          host: this.hostname,
-          severity: this.classifyLineSeverity(line),
-          user: this.extractUserFromLine(filePath, line),
-          file: filePath,
-          source: 'inotify',
-          message: line,
-        });
+      try {
+        const deltaBytes = st.size - base.size;
+        const startOffset = deltaBytes > MAX_TAIL_READ_BYTES ? st.size - MAX_TAIL_READ_BYTES : base.size;
+        const newText = this.readRangeUtf8(filePath, startOffset, Math.min(deltaBytes, MAX_TAIL_READ_BYTES));
+        for (const line of newText.split('\n')) {
+          if (!line.trim()) continue;
+          this.pushLogEvent({
+            agentId: 'agent-000',
+            host: this.hostname,
+            severity: this.classifyLineSeverity(line),
+            user: this.extractUserFromLine(filePath, line),
+            file: filePath,
+            source: 'inotify',
+            message: line,
+          });
+        }
+      } catch {
+        // ignore transient tail read errors
       }
     }
 
@@ -1201,16 +1351,20 @@ export class TamperEngine {
   // --- Multi-Agent Enrollment & Real-Time Ingestion ---
 
   public enrollAgent(name: string, ip: string, osLabel: string): AgentNode {
+    const remoteCount = this.agents.filter((a) => !a.isManager).length;
+    if (remoteCount >= MAX_REMOTE_AGENTS) {
+      throw new Error(`Maximum remote agent limit (${MAX_REMOTE_AGENTS}) reached.`);
+    }
     this.agentSeq += 1;
     const id = `agent-${String(this.agentSeq).padStart(3, '0')}`;
-    const token = `tok-${crypto.randomBytes(8).toString('hex')}`;
-    const cleanName = name.trim().replace(/[^a-zA-Z0-9._-]/g, '-') || `linux-node-${this.agentSeq}`;
+    const token = `tok-${crypto.randomBytes(24).toString('hex')}`;
+    const cleanName = name.trim().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 128) || `linux-node-${this.agentSeq}`;
     const node: AgentNode = {
       id,
       name: cleanName,
       hostname: cleanName,
-      ip: ip.trim() || '0.0.0.0',
-      os: osLabel.trim() || 'Linux x86_64',
+      ip: ip.trim().slice(0, 64) || '0.0.0.0',
+      os: osLabel.trim().slice(0, 128) || 'Linux x86_64',
       kernel: 'pending-checkin',
       version: 'tamperer-agent-2.4.0',
       status: 'pending',
@@ -1225,6 +1379,7 @@ export class TamperEngine {
       memUsed: '0%',
     };
     this.agents.push(node);
+    this.savePersistedAgents();
     this.emit('agents', this.agents);
     this.emit('status', this.getStatus());
     return node;
@@ -1260,35 +1415,42 @@ export class TamperEngine {
     }>;
   }): { ok: boolean; acceptedEvents: number; error?: string } {
     const agent = this.agents.find((a) => a.id === payload.agentId);
-    if (!agent) {
-      return { ok: false, acceptedEvents: 0, error: 'Unknown agentId' };
+    if (!agent || agent.isManager || agent.id === 'agent-000' || !agent.token || typeof payload.token !== 'string' || payload.token.length === 0) {
+      return { ok: false, acceptedEvents: 0, error: 'Invalid agent credentials' };
     }
-    if (payload.token && agent.token !== payload.token) {
-      return { ok: false, acceptedEvents: 0, error: 'Invalid agent token' };
+    const suppliedDigest = crypto.createHash('sha256').update(payload.token).digest();
+    const expectedDigest = crypto.createHash('sha256').update(agent.token).digest();
+    if (!crypto.timingSafeEqual(suppliedDigest, expectedDigest)) {
+      return { ok: false, acceptedEvents: 0, error: 'Invalid agent credentials' };
     }
 
     agent.status = 'active';
     agent.lastKeepAlive = nowIso();
-    if (payload.hostname) agent.hostname = payload.hostname;
-    if (payload.os) agent.os = payload.os;
-    if (payload.kernel) agent.kernel = payload.kernel;
+    if (payload.hostname) agent.hostname = payload.hostname.slice(0, 256);
+    if (payload.os) agent.os = payload.os.slice(0, 256);
+    if (payload.kernel) agent.kernel = payload.kernel.slice(0, 256);
 
     if (Array.isArray(payload.baselines)) {
+      let agentBaselineCount = Array.from(this.remoteBaselines.values()).filter((rb) => rb.agentId === agent.id).length;
       for (const b of payload.baselines) {
-        if (!b.path) continue;
-        const key = `${agent.id}::${b.path}`;
+        if (!b.path || !b.path.startsWith('/')) continue;
+        const cleanRemotePath = path.posix.resolve(b.path);
+        const key = `${agent.id}::${cleanRemotePath}`;
         const existing = this.remoteBaselines.get(key);
+        if (!existing && agentBaselineCount >= MAX_REMOTE_BASELINES_PER_AGENT) {
+          continue;
+        }
         const modeVal = b.mode ?? 0o640;
         const uidVal = b.uid ?? 0;
         const gidVal = b.gid ?? 4;
         this.remoteBaselines.set(key, {
           agentId: agent.id,
           host: agent.hostname,
-          path: b.path,
-          category: this.categoryForPath(b.path),
+          path: cleanRemotePath,
+          category: this.categoryForPath(cleanRemotePath),
           exists: true,
-          isBinary: this.isBinaryFile(b.path),
-          inplaceOk: this.isInplaceOk(b.path),
+          isBinary: this.isBinaryFile(cleanRemotePath),
+          inplaceOk: this.isInplaceOk(cleanRemotePath),
           hardened: existing?.hardened ?? false,
           ino: b.ino ?? 0,
           size: b.size ?? 0,
@@ -1304,6 +1466,7 @@ export class TamperEngine {
           status: existing?.status === 'tampered' ? 'tampered' : 'verified',
           lastEventAt: nowTimeShort(),
         });
+        if (!existing) agentBaselineCount += 1;
       }
     }
 
@@ -1364,6 +1527,7 @@ export class TamperEngine {
     if (action === 'toggle-status') {
       agent.status = agent.status === 'active' ? 'disconnected' : 'active';
       agent.lastKeepAlive = nowIso();
+      this.savePersistedAgents();
       this.emit('agents', this.agents);
       this.emit('status', this.getStatus());
       return { ok: true, message: `Agent ${agent.hostname} is now ${agent.status}` };
@@ -1575,7 +1739,13 @@ export class TamperEngine {
   public hardenFiles(pathsToHarden?: string[]): string[] {
     const targets = pathsToHarden ?? [...DEFAULT_HARDEN_PATHS, this.alertChainPath];
     const out: string[] = [];
-    for (const p of targets) {
+    for (const rawPath of targets) {
+      const check = this.isManagedPath(rawPath);
+      if (!check.ok) {
+        out.push(`[denied] ${rawPath}: ${check.reason}`);
+        continue;
+      }
+      const p = check.resolved;
       if (!fs.existsSync(p)) {
         out.push(`[skip] ${p} does not exist on this machine`);
         continue;
@@ -1586,7 +1756,7 @@ export class TamperEngine {
         // Container fs may restrict immutable flags; track in engine state too
       }
       this.hardenedPaths.add(p);
-      const b = this.baselines.get(p);
+      const b = this.baselines.get(p) ?? this.baselines.get(rawPath);
       if (b) b.hardened = true;
       out.push(`[ok] chattr +a ${p}`);
     }
@@ -1597,7 +1767,13 @@ export class TamperEngine {
   public unhardenFiles(pathsToUnharden?: string[]): string[] {
     const targets = pathsToUnharden ?? Array.from(this.hardenedPaths);
     const out: string[] = [];
-    for (const p of targets) {
+    for (const rawPath of targets) {
+      const check = this.isManagedPath(rawPath);
+      if (!check.ok) {
+        out.push(`[denied] ${rawPath}: ${check.reason}`);
+        continue;
+      }
+      const p = check.resolved;
       if (fs.existsSync(p)) {
         try {
           execFileSync('chattr', ['-a', p], { stdio: 'pipe' });
@@ -1606,7 +1782,8 @@ export class TamperEngine {
         }
       }
       this.hardenedPaths.delete(p);
-      const b = this.baselines.get(p);
+      this.hardenedPaths.delete(rawPath);
+      const b = this.baselines.get(p) ?? this.baselines.get(rawPath);
       if (b) b.hardened = false;
       out.push(`[ok] chattr -a ${p}`);
     }
@@ -1644,9 +1821,11 @@ export class TamperEngine {
   }
 
   public rebaselineFile(filePath: string): BaselineRecord | null {
-    const b = this.computeBaseline(filePath);
+    const check = this.isManagedPath(filePath);
+    if (!check.ok) return null;
+    const b = this.computeBaseline(check.resolved);
     if (!b) return null;
-    this.baselines.set(filePath, b);
+    this.baselines.set(check.resolved, b);
     this.emit('baselines', this.getBaselines());
     return b;
   }
@@ -1687,16 +1866,45 @@ export class TamperEngine {
     return { line: targetIdx + 1 };
   }
 
-  public readFileContent(filePath: string): { exists: boolean; isBinary: boolean; content: string; size: number; sha256: string } {
-    if (!fs.existsSync(filePath)) {
+  public readFileContent(filePath: string): {
+    exists: boolean;
+    isBinary: boolean;
+    content: string;
+    size: number;
+    sha256: string;
+    denied?: boolean;
+    error?: string;
+  } {
+    const check = this.isManagedPath(filePath);
+    if (!check.ok) {
+      return { exists: false, isBinary: false, content: '', size: 0, sha256: '', denied: true, error: check.reason };
+    }
+    const target = check.resolved;
+    if (!fs.existsSync(target)) {
       return { exists: false, isBinary: false, content: '', size: 0, sha256: '' };
     }
-    const buf = fs.readFileSync(filePath);
-    const isBin = this.isBinaryFile(filePath);
-    const content = isBin
-      ? buf.subarray(0, 2048).toString('hex').replace(/(.{2})/g, '$1 ').trim()
-      : buf.toString('utf8').slice(-32000);
-    return { exists: true, isBinary: isBin, content, size: buf.length, sha256: sha256Hex(buf) };
+    const st = fs.lstatSync(target);
+    if (!st.isFile()) {
+      return { exists: false, isBinary: false, content: '', size: 0, sha256: '', error: 'Not a regular file' };
+    }
+    const isBin = this.isBinaryFile(target);
+    const { digest } = this.hashPrefixStream(target, HASH_CAP_BYTES);
+    let content = '';
+    if (isBin) {
+      const headLen = Math.min(2048, st.size);
+      const fd = fs.openSync(target, 'r');
+      try {
+        const b = Buffer.alloc(headLen);
+        const n = fs.readSync(fd, b, 0, headLen, 0);
+        content = b.subarray(0, n).toString('hex').replace(/(.{2})/g, '$1 ').trim();
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      const start = Math.max(0, st.size - 32000);
+      content = this.readRangeUtf8(target, start, st.size - start);
+    }
+    return { exists: true, isBinary: isBin, content, size: st.size, sha256: digest };
   }
 
   public executeCommand(rawCmd: string): TerminalExecResult {
@@ -1826,11 +2034,16 @@ export class TamperEngine {
       return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: [], monitorAction: 'started' };
     }
 
-    // 2. tee -a on real machine path
+    // 2. tee -a on managed machine path
     const teeMatch = cmd.match(/^echo\s+(['"]?)(.+?)\1\s*\|\s*(?:sudo\s+)?tee\s+-a\s+(\S+)$/);
     if (teeMatch) {
       const text = teeMatch[2];
-      const target = teeMatch[3];
+      const check = this.isManagedPath(teeMatch[3]);
+      if (!check.ok) {
+        stderr.push(`tee: ${teeMatch[3]}: ${check.reason}`);
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
+      const target = check.resolved;
       try {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         this.internalWritePaths.add(target);
@@ -1847,10 +2060,24 @@ export class TamperEngine {
       return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: Array.from(triggered) };
     }
 
-    // 3. sed -i on real path
+    // 3. sed -i on managed path
     const sedMatch = normalized.match(/^sed\s+(?:-i|--in-place)\s+(['"])s\/([^/]*)\/([^/]*)\/(g?)\1\s+(\S+)$/);
     if (sedMatch) {
-      const [, , search, replace, gFlag, target] = sedMatch;
+      const [, , search, replace, gFlag, rawTarget] = sedMatch;
+      const check = this.isManagedPath(rawTarget);
+      if (!check.ok) {
+        stderr.push(`sed: ${rawTarget}: ${check.reason}`);
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
+      const target = check.resolved;
+      if (search.length > 256 || replace.length > 512) {
+        stderr.push('sed: pattern or replacement exceeds safety length limit');
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
+      if (/(\([^)]*[+*][^)]*\))[+*]/.test(search)) {
+        stderr.push('sed: nested-quantifier regex rejected for safety');
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
       if (this.hardenedPaths.has(target)) {
         stderr.push(`sed: ${target}: Operation not permitted (chattr +a)`);
         return { command: rawCmd, stdout, stderr, exitCode: 4, cwd, triggeredRules: [] };
@@ -1860,7 +2087,8 @@ export class TamperEngine {
         return { command: rawCmd, stdout, stderr, exitCode: 2, cwd, triggeredRules: [] };
       }
       try {
-        const next = fs.readFileSync(target, 'utf8').replace(new RegExp(search, gFlag ? 'g' : ''), replace);
+        const re = new RegExp(search, gFlag ? 'g' : '');
+        const next = fs.readFileSync(target, 'utf8').replace(re, replace);
         const tmp = `${target}.sedtmp.${Date.now()}`;
         this.internalWritePaths.add(target);
         try {
@@ -1900,11 +2128,16 @@ export class TamperEngine {
       return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: Array.from(triggered) };
     }
 
-    // 4. truncate on real path
+    // 4. truncate on managed path
     const truncMatch = normalized.match(/^truncate\s+-s\s+(\d+)\s+(\S+)$/);
     if (truncMatch) {
       const size = Number(truncMatch[1]);
-      const target = truncMatch[2];
+      const check = this.isManagedPath(truncMatch[2]);
+      if (!check.ok) {
+        stderr.push(`truncate: ${truncMatch[2]}: ${check.reason}`);
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
+      const target = check.resolved;
       if (this.hardenedPaths.has(target)) {
         stderr.push(`truncate: failed to truncate '${target}': Operation not permitted (chattr +a)`);
         return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
@@ -1946,11 +2179,16 @@ export class TamperEngine {
       return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: Array.from(triggered) };
     }
 
-    // 5. chmod on real path
+    // 5. chmod on managed path
     const chmodMatch = normalized.match(/^chmod\s+([0-7]{3,4})\s+(\S+)$/);
     if (chmodMatch) {
       const modeVal = parseInt(chmodMatch[1], 8);
-      const target = chmodMatch[2];
+      const check = this.isManagedPath(chmodMatch[2]);
+      if (!check.ok) {
+        stderr.push(`chmod: ${chmodMatch[2]}: ${check.reason}`);
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
+      const target = check.resolved;
       if (!fs.existsSync(target)) {
         stderr.push(`chmod: cannot access '${target}': No such file or directory`);
         return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
@@ -1968,11 +2206,16 @@ export class TamperEngine {
       return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: Array.from(triggered) };
     }
 
-    // 6. rm on real path
+    // 6. rm on managed path
     const rmMatch = normalized.match(/^(rm|unlink)(?:\s+-[A-Za-z]+)*\s+(\S+)$/);
     if (rmMatch) {
       const bin = rmMatch[1];
-      const target = rmMatch[2];
+      const check = this.isManagedPath(rmMatch[2]);
+      if (!check.ok) {
+        stderr.push(`${bin}: cannot remove '${rmMatch[2]}': ${check.reason}`);
+        return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+      }
+      const target = check.resolved;
       if (this.hardenedPaths.has(target)) {
         stderr.push(`${bin}: cannot remove '${target}': Operation not permitted (chattr +a)`);
         return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
@@ -2008,12 +2251,70 @@ export class TamperEngine {
       return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: Array.from(triggered) };
     }
 
-    // 7. Real read-only shell commands executed directly on the host machine
-    const allowedReadOnlyBins = new Set(['ls', 'cat', 'head', 'tail', 'stat', 'lsattr', 'whoami', 'id', 'pwd', 'uname', 'df', 'uptime', 'ps', 'grep']);
-    const binName = normalized.split(/\s+/)[0];
-    if (allowedReadOnlyBins.has(binName)) {
+    // 7. Scoped read-only commands executed directly on the host machine
+    const pathBins = new Set(['ls', 'cat', 'head', 'tail', 'stat', 'lsattr', 'grep']);
+    const infoBins = new Set(['whoami', 'id', 'pwd', 'uname', 'df', 'uptime', 'ps']);
+    const tokenizeArgs = (input: string): string[] => {
+      const tokens: string[] = [];
+      let cur = '';
+      let q: '"' | "'" | null = null;
+      for (let i = 0; i < input.length; i += 1) {
+        const ch = input[i];
+        if ((ch === '"' || ch === "'") && input[i - 1] !== '\\') {
+          q = q === ch ? null : q === null ? ch : q;
+        } else if (!q && /\s/.test(ch)) {
+          if (cur.length > 0) { tokens.push(cur); cur = ''; }
+        } else {
+          cur += ch;
+        }
+      }
+      if (cur.length > 0) tokens.push(cur);
+      return tokens;
+    };
+
+    const argv = tokenizeArgs(normalized);
+    const binName = argv[0] || '';
+    const args = argv.slice(1);
+
+    if (pathBins.has(binName) || infoBins.has(binName)) {
+      if (infoBins.has(binName)) {
+        const badArg = args.find((a) => !a.startsWith('-'));
+        if (badArg) {
+          stderr.push(`${binName}: argument '${badArg}' is not permitted in scoped shell`);
+          return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+        }
+      } else {
+        if (binName === 'grep' && args.some((a) => a === '-f' || a.startsWith('--file'))) {
+          stderr.push('grep: reading patterns from files (-f) is disabled');
+          return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+        }
+        const nonFlagArgs: string[] = [];
+        for (let i = 0; i < args.length; i += 1) {
+          const a = args[i];
+          if (a === '-n' || a === '-c' || a === '-e' || a === '-A' || a === '-B' || a === '-C') {
+            i += 1;
+            continue;
+          }
+          if (a.startsWith('-')) continue;
+          nonFlagArgs.push(a);
+        }
+        const pathArgs = binName === 'grep' ? nonFlagArgs.slice(1) : nonFlagArgs;
+        if (binName !== 'ls' && pathArgs.length === 0) {
+          stderr.push(`${binName}: specify an absolute path inside /var/log or ${this.chainDir}`);
+          return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+        }
+        if (binName === 'ls' && pathArgs.length === 0) {
+          args.push('/var/log');
+        }
+        for (const pArg of pathArgs) {
+          const check = this.isManagedPath(pArg);
+          if (!check.ok) {
+            stderr.push(`${binName}: ${pArg}: ${check.reason}`);
+            return { command: rawCmd, stdout, stderr, exitCode: 1, cwd, triggeredRules: [] };
+          }
+        }
+      }
       try {
-        const args = normalized.split(/\s+/).slice(1);
         const out = execFileSync(binName, args, { encoding: 'utf8', maxBuffer: 512 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
         if (out) stdout.push(...out.replace(/\n$/, '').split('\n'));
         return { command: rawCmd, stdout, stderr, exitCode: 0, cwd, triggeredRules: [] };
