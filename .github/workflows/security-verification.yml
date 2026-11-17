@@ -1,0 +1,41 @@
+name: Security branch verification
+on:
+  push:
+    branches: [fix/security-hardening]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: authentication
+            command: ./node_modules/.bin/tsx --test server/apiSecurity.test.ts server/engineAuth.test.ts
+          - check: types
+            command: npm run lint
+          - check: build
+            command: npm run build
+    name: ${{ matrix.check }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.21.0'
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f package-lock.json; then
+            npm ci --legacy-peer-deps --no-audit --no-fund
+          else
+            npm install --legacy-peer-deps --no-audit --no-fund
+          fi
+      - name: Run ${{ matrix.check }} verification
+        run: ${{ matrix.command }}
