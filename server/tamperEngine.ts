@@ -1259,13 +1259,16 @@ export class TamperEngine {
       digest?: string;
     }>;
   }): { ok: boolean; acceptedEvents: number; error?: string } {
+    const rejected = () => ({ ok: false, acceptedEvents: 0, error: 'Invalid agent credentials' });
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return rejected();
+    if (typeof payload.agentId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(payload.agentId)) return rejected();
+    if (typeof payload.token !== 'string' || payload.token.length === 0 || payload.token.length > 512) return rejected();
+
     const agent = this.agents.find((a) => a.id === payload.agentId);
-    if (!agent) {
-      return { ok: false, acceptedEvents: 0, error: 'Unknown agentId' };
-    }
-    if (payload.token && agent.token !== payload.token) {
-      return { ok: false, acceptedEvents: 0, error: 'Invalid agent token' };
-    }
+    if (!agent || agent.isManager || agent.id === 'agent-000') return rejected();
+    if (typeof agent.token !== 'string' || agent.token.length === 0 || agent.token.length > 512) return rejected();
+    const tokenDigest = (token: string) => crypto.createHash('sha256').update(token, 'utf8').digest();
+    if (!crypto.timingSafeEqual(tokenDigest(payload.token), tokenDigest(agent.token))) return rejected();
 
     agent.status = 'active';
     agent.lastKeepAlive = nowIso();
