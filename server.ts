@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { buildAgentPythonScript, buildKaliTarGz, KALI_BUNDLE_FILES } from './server/kaliBundle.ts';
 import { TamperEngine } from './server/tamperEngine.ts';
+import { TriggerCorrelator } from './server/triggerCorrelator.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -12,6 +13,10 @@ async function bootstrap() {
   app.use(express.json({ limit: '2mb' }));
 
   const engine = new TamperEngine(process.cwd());
+
+  // Trigger capture: correlate auditd events to tamper alerts
+  const correlator = new TriggerCorrelator(engine);
+  correlator.start();
 
   app.get('/api/state', (_req, res) => {
     res.json(engine.getSnapshot());
@@ -70,7 +75,7 @@ async function bootstrap() {
     }
     const result = engine.runAgentAction(req.params.id, action);
     if (!result.ok) {
-      res.status(404).json(result);
+      res.status(404).json({ error: 'Agent not found' });
       return;
     }
     res.json({ ...result, snapshot: engine.getSnapshot() });
