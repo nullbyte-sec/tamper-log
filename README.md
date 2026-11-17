@@ -121,6 +121,41 @@ sudo rm /var/log/test.log
 sudo tamplogs --verify
 ```
 
+## Trigger Capture (auditd correlation)
+
+When a tamper alert fires, Tamper Blocker correlates it with the auditd event
+that caused the write, so you can see *what process/command* triggered it —
+not just that a file changed.
+
+### How it works
+
+- On startup, the server installs `auditctl -w <path> -p w -k tamper_watch`
+  rules for baselined `/var/log` files (idempotent).
+- A continuous tail of `/var/log/audit/audit.log` feeds an in-memory ring
+  buffer keyed by the PATH record's `name=`.
+- When an alert fires, the correlator searches the buffer for a matching
+  audit event within `poll interval + slack` (5s window).
+- The matched event's `pid`, `ppid`, `uid`, `exe`, `argv` (reassembled from
+  split `a0=`/`a1=`/… and hex-decoded), `cwd`, and `tty` are attached to the
+  alert as a `trigger` object.
+
+### Requirements
+
+- `auditd` installed and running
+- Server running as root (to read `/var/log/audit/audit.log` and install rules)
+
+### What you'll see
+
+On each alert card: `uid 1000 · bash → curl -o /var/log/test.log ... · tty /dev/pts/3 · cwd /home/kali`
+with an expandable full-argv panel.
+
+### Important caveat
+
+Trigger context is **advisory, not tamper-evident proof**. The hash chain proves
+the alert existed; it does not prove the trigger wasn't rewritten afterward.
+For exact causation (not just correlation), fanotify/eBPF integration is planned
+as a v2 feature.
+
 ## Cautions
 
 - `--harden` sets `chattr +a` on logs; logrotate can't rotate them until `--unharden` runs.

@@ -11,6 +11,14 @@ interface AlertsViewProps {
   onJumpToTerminal: () => void;
 }
 
+const TRIGGER_UNAVAILABLE_LABELS: Record<string, string> = {
+  auditd_missing: 'auditd is not installed on this host',
+  auditd_not_running: 'auditd service is not running',
+  rules_not_installed: 'audit watch rules are not installed',
+  no_event_in_window: 'no matching audit event found in the correlation window',
+  insufficient_privileges: 'insufficient privileges to read audit log or install rules',
+};
+
 export const AlertsView: React.FC<AlertsViewProps> = ({
   alerts,
   selectedAgentId,
@@ -20,6 +28,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
 }) => {
   const [filter, setFilter] = useState<'unacked' | 'all' | 'acked'>('all');
   const [selectedAlert, setSelectedAlert] = useState<TamperAlert | null>(null);
+  const [showFullArgv, setShowFullArgv] = useState(false);
 
   const scopedAlerts = useMemo(
     () => (selectedAgentId === 'ALL' ? alerts : alerts.filter((a) => a.agentId === selectedAgentId)),
@@ -98,9 +107,9 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
             <button
               type="button"
               onClick={() => void onAcknowledgeAll()}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-red-600 hover:bg-red-500 text-white transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-md bg-red-600 hover:bg-red-500 text-white transition-colors whitespace-nowrap shrink-0"
             >
-              <CheckCheck className="w-3.5 h-3.5" />
+              <CheckCheck className="w-3 h-3" />
               Acknowledge All ({unackedCount})
             </button>
           )}
@@ -220,6 +229,50 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
                   <span className="text-slate-500">Observed After</span>
                   <span className="text-red-300 text-right">{activeDetail.afterSummary}</span>
                 </div>
+
+                {/* Triggered By */}
+                <div className="py-2 border-b border-slate-800/60">
+                  <div className="text-slate-500 mb-1">Triggered By</div>
+                  {activeDetail.trigger ? (
+                    <div className="space-y-1">
+                      <div className="text-slate-200">
+                        uid {activeDetail.trigger.uid} · {activeDetail.trigger.exe}
+                        {activeDetail.trigger.argv.length > 0 && (
+                          <span className="text-sky-300"> → {activeDetail.trigger.argv.join(' ')}</span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-slate-500">
+                        tty {activeDetail.trigger.tty || 'n/a'} · cwd {activeDetail.trigger.cwd || 'n/a'} · confidence {activeDetail.trigger.confidence} ({activeDetail.trigger.matches} match{activeDetail.trigger.matches === 1 ? '' : 'es'})
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowFullArgv((v) => !v)}
+                        className="text-[11px] text-sky-400 hover:text-sky-300"
+                      >
+                        {showFullArgv ? 'Hide full argv' : 'Show full argv'}
+                      </button>
+                      {showFullArgv && (
+                        <div className="p-2 bg-[#0E1522] border border-slate-800 rounded text-[11px] text-slate-300 break-all">
+                          {activeDetail.trigger.argv.map((arg, i) => (
+                            <div key={i}>a{i}={arg}</div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="text-[10px] text-amber-500/80">
+                        Trigger context is advisory, not tamper-evident proof.
+                      </div>
+                    </div>
+                  ) : activeDetail.triggerPending ? (
+                    <div className="text-slate-400">Resolving trigger…</div>
+                  ) : activeDetail.triggerUnavailable ? (
+                    <div className="text-slate-400">
+                      Trigger unknown — {TRIGGER_UNAVAILABLE_LABELS[activeDetail.triggerUnavailable] ?? activeDetail.triggerUnavailable}
+                    </div>
+                  ) : (
+                    <div className="text-slate-500">No trigger information</div>
+                  )}
+                </div>
+
                 <div className="py-1">
                   <div className="text-slate-500 mb-1">Chain Proof (seq #{activeDetail.seq})</div>
                   <div className="p-2 bg-[#0E1522] border border-slate-800 rounded text-[11px] text-emerald-400 break-all">
