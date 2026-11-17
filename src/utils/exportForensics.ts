@@ -8,6 +8,10 @@ function csvEscape(val: unknown): string {
   return str;
 }
 
+function triggerArgvString(alert: TamperAlert): string {
+  return alert.trigger ? alert.trigger.argv.join(' ') : '';
+}
+
 function triggerDownload(filename: string, content: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -49,6 +53,10 @@ export function exportAlertsToCsv(alerts: TamperAlert[], scopeLabel = 'all'): vo
     'acknowledged_at',
     'prev_hash',
     'chain_hash',
+    'trigger_exe',
+    'trigger_argv',
+    'trigger_confidence',
+    'trigger_unavailable',
   ];
 
   const rows = alerts.map((a) =>
@@ -76,6 +84,10 @@ export function exportAlertsToCsv(alerts: TamperAlert[], scopeLabel = 'all'): vo
       a.acknowledgedAt ?? '',
       a.prevHash,
       a.chainHash,
+      a.trigger?.exe ?? '',
+      triggerArgvString(a),
+      a.trigger?.confidence ?? '',
+      a.triggerUnavailable ?? '',
     ]
       .map(csvEscape)
       .join(','),
@@ -91,6 +103,7 @@ export function exportAlertsToJson(alerts: TamperAlert[], scopeLabel = 'all'): v
     exportType: 'forensic_alerts',
     scope: scopeLabel,
     count: alerts.length,
+    triggerContextNote: 'Trigger context is advisory, not tamper-evident proof.',
     alerts,
   };
   triggerDownload(
