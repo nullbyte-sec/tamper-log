@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { buildAgentPythonScript, buildKaliTarGz, KALI_BUNDLE_FILES } from './server/kaliBundle.ts';
 import { TamperEngine } from './server/tamperEngine.ts';
+import { exec } from 'node:child_process';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -258,7 +259,8 @@ echo "Tamperer Agent (${agentId}) installed and streaming to ${managerUrl}."
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  app.listen(PORT, '127.0.0.1', () => {
+  exec(`xdg-open http://127.0.0.1:${PORT}`, () => {});
     console.log(`Tamperer server running on http://0.0.0.0:${PORT}`);
   });
 }
