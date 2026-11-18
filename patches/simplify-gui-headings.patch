@@ -1,0 +1,15 @@
+--- a/src/components/DashboardView.tsx
++++ b/src/components/DashboardView.tsx
+@@ -481,1 +481,1 @@
+-            <h3 className="text-xs font-semibold text-slate-200">Live Tamper Alert Feed (Wazuh Rule Engine)</h3>
++            <h3 className="text-xs font-semibold text-slate-200">Live Tamper Alert Feed</h3>
+--- a/src/components/AlertsView.tsx
++++ b/src/components/AlertsView.tsx
+@@ -47,1 +47,1 @@
+-          <h2 className="text-sm font-semibold text-slate-100">Live Tamper Alerts &amp; Wazuh Incident Queue</h2>
++          <h2 className="text-sm font-semibold text-slate-100">Live Tamper Alerts</h2>
+--- a/src/components/AgentsView.tsx
++++ b/src/components/AgentsView.tsx
+@@ -69,1 +69,1 @@
+-            <h2 className="text-sm font-semibold text-slate-100">Enroll Remote Linux Agent (Wazuh Model)</h2>
++            <h2 className="text-sm font-semibold text-slate-100">Enroll Remote Linux Agent</h2>
