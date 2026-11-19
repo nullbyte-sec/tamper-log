@@ -3,7 +3,6 @@ import { CheckCircle2, Play, RotateCcw, XCircle } from 'lucide-react';
 import type { TestStepResult } from '../types/tamper';
 
 interface TestPlanViewProps {
-  demoActionsEnabled: boolean;
   onRunStep: (step: number) => Promise<TestStepResult | null>;
   onResetSandbox: () => Promise<void>;
 }
@@ -21,7 +20,7 @@ const SECTION_12_STEPS = [
   { step: 10, name: 'Audit rules', command: 'sudo auditctl -l; sudo ausearch -k log_tamper -i -c tee --start recent', expected: 'never and always rules listed; SYSCALL record with comm=tee.' },
 ];
 
-export const TestPlanView: React.FC<TestPlanViewProps> = ({ demoActionsEnabled, onRunStep, onResetSandbox }) => {
+export const TestPlanView: React.FC<TestPlanViewProps> = ({ onRunStep, onResetSandbox }) => {
   const [results, setResults] = useState<Record<number, TestStepResult>>({});
   const [runningStep, setRunningStep] = useState<number | null>(null);
   const [runningAll, setRunningAll] = useState(false);
@@ -60,11 +59,6 @@ export const TestPlanView: React.FC<TestPlanViewProps> = ({ demoActionsEnabled, 
             Executes real commands against <code className="font-mono text-slate-300">/var/log/test.log</code> &amp; daemons ·{' '}
             {Object.keys(results).length > 0 ? `${passedCount} / ${Object.keys(results).length} passed` : 'Ready to execute'}
           </p>
-          {!demoActionsEnabled && (
-            <p className="text-xs text-amber-300 font-mono mt-1.5">
-              Destructive test-plan steps &amp; reset are disabled (`TAMPERER_ENABLE_DEMO_ACTIONS=0`). Set `TAMPERER_ENABLE_DEMO_ACTIONS=1` in server env to run automated drills.
-            </p>
-          )}
         </div>
 
         <div className="flex items-center gap-2 shrink-0">

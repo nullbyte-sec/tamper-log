@@ -11,7 +11,6 @@ interface ChainsAuditViewProps {
   recentMirrorChain: ChainRecord[];
   auditRules: AuditRuleEntry[];
   services: ServiceStatus[];
-  demoActionsEnabled: boolean;
   onVerifyChains: () => Promise<void>;
   onCorruptDemo: () => Promise<void>;
   onToggleService: (svc: ServiceStatus['name'], currentlyActive: boolean) => Promise<void>;
@@ -23,7 +22,6 @@ export const ChainsAuditView: React.FC<ChainsAuditViewProps> = ({
   recentMirrorChain,
   auditRules,
   services,
-  demoActionsEnabled,
   onVerifyChains,
   onCorruptDemo,
   onToggleService,
@@ -56,9 +54,7 @@ export const ChainsAuditView: React.FC<ChainsAuditViewProps> = ({
               <button
                 type="button"
                 onClick={() => void onCorruptDemo()}
-                disabled={!demoActionsEnabled}
-                title={demoActionsEnabled ? 'Modify last record in alerts.chain for tamper-verification test' : 'Disabled unless TAMPERER_ENABLE_DEMO_ACTIONS=1'}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-45 text-amber-300 border border-slate-700 transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 transition-colors whitespace-nowrap"
               >
                 <AlertTriangle className="w-3.5 h-3.5" />
                 Simulate Chain Edit

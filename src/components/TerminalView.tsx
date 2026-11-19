@@ -11,7 +11,6 @@ interface TerminalLine {
 interface TerminalViewProps {
   status: MonitorStatus;
   liveLogs: LogEvent[];
-  terminalEnabled: boolean;
   onExecute: (command: string) => Promise<TerminalExecResult | null>;
   onStartMonitor: () => Promise<void>;
   onStopMonitor: () => Promise<void>;
@@ -56,7 +55,6 @@ const QUICK_MACROS: Array<{ label: string; command: string; tone: 'primary' | 's
 export const TerminalView: React.FC<TerminalViewProps> = ({
   status,
   liveLogs,
-  terminalEnabled,
   onExecute,
   onStartMonitor,
   onStopMonitor,
@@ -184,11 +182,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             <p className="text-xs text-slate-400 mt-0.5">
               Type <code className="text-sky-400 font-mono">tamplogs</code> to start real-time monitoring across all logs, or execute Kali commands below to test detection.
             </p>
-            {!terminalEnabled && (
-              <p className="text-xs text-amber-300 font-mono mt-1.5">
-                Host shell execution is currently disabled (`TAMPERER_ENABLE_TERMINAL=0`). Use &quot;Run tamplogs&quot; / &quot;Start Monitor&quot; buttons, or set `TAMPERER_ENABLE_TERMINAL=1` to enable shell commands.
-              </p>
-            )}
           </div>
           <div className="flex items-center gap-2 shrink-0">
             {status.active ? (

@@ -61,27 +61,6 @@ export interface LogEvent {
   mitreId?: string;
 }
 
-export interface TriggerInfo {
-  pid: number;
-  ppid: number;
-  uid: number;
-  exe: string;
-  argv: string[];
-  cwd: string;
-  tty: string;
-  timestamp: string;
-  source: 'auditd';
-  confidence: 'correlated';
-  matches: number;
-}
-
-export type TriggerUnavailableReason =
-  | 'auditd_missing'
-  | 'auditd_not_running'
-  | 'rules_not_installed'
-  | 'no_event_in_window'
-  | 'insufficient_privileges';
-
 export interface TamperAlert {
   id: string;
   seq: number;
@@ -108,9 +87,6 @@ export interface TamperAlert {
   acknowledgedAt?: string;
   chainHash: string;
   prevHash: string;
-  trigger?: TriggerInfo;
-  triggerPending?: boolean;
-  triggerUnavailable?: TriggerUnavailableReason;
 }
 
 export interface BaselineRecord {
@@ -255,10 +231,6 @@ export interface AppSnapshot {
   recentAlertChain: ChainRecord[];
   recentMirrorChain: ChainRecord[];
   configYaml: string;
-  capabilities?: {
-    terminalEnabled: boolean;
-    demoActionsEnabled: boolean;
-  };
 }
 
 export interface KaliBundleFile {
